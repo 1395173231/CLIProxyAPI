@@ -5,7 +5,11 @@ package cliproxy
 
 import (
 	"fmt"
-
+	"os"
+	"strconv"
+	"strings"
+	"time"
+ 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -59,6 +63,27 @@ type Hooks struct {
 	// OnAfterStart is called after the service has started successfully,
 	// providing access to the service instance for additional operations.
 	OnAfterStart func(*Service)
+}
+
+// envLookup returns the first non-empty env value for provided keys.
+func envLookup(keys ...string) (string, bool) {
+	for _, k := range keys {
+		if v, ok := os.LookupEnv(k); ok {
+			if s := strings.TrimSpace(v); s != "" {
+				return s, true
+			}
+		}
+	}
+	return "", false
+}
+
+func parseBoolEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // NewBuilder creates a Builder with default dependencies left unset.
@@ -197,7 +222,52 @@ func (b *Builder) Build() (*Service, error) {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
-		coreManager = coreauth.NewManager(tokenStore, nil, nil)
+		// Choose sticky selector: Redis-backed when enabled, otherwise in-memory
+		var selector coreauth.Selector
+		if b.cfg != nil {
+			sti := b.cfg.SDKConfig.StickyIndex
+			// Environment overrides (take precedence over YAML)
+			if v, ok := envLookup("STICKY_INDEX_REDIS_ENABLED", "sticky_index_redis_enabled"); ok {
+				sti.RedisEnabled = parseBoolEnv(v)
+			}
+			if v, ok := envLookup("STICKY_INDEX_REDIS_ADDR", "sticky_index_redis_addr"); ok {
+				sti.RedisAddr = v
+			}
+			if v, ok := envLookup("STICKY_INDEX_REDIS_PASSWORD", "sticky_index_redis_password"); ok {
+				sti.RedisPassword = v
+			}
+			if v, ok := envLookup("STICKY_INDEX_REDIS_DB", "sticky_index_redis_db"); ok {
+				if n, err := strconv.Atoi(v); err == nil {
+					sti.RedisDB = n
+				}
+			}
+			if v, ok := envLookup("STICKY_INDEX_REDIS_PREFIX", "sticky_index_redis_prefix"); ok {
+				sti.RedisPrefix = v
+			}
+			if v, ok := envLookup("STICKY_INDEX_TTL_SECONDS", "sticky_index_ttl_seconds"); ok {
+				if n, err := strconv.Atoi(v); err == nil {
+					sti.TTLSeconds = n
+				}
+			}
+	
+			if sti.RedisEnabled {
+				var ttl time.Duration
+				if sti.TTLSeconds > 0 {
+					ttl = time.Duration(sti.TTLSeconds) * time.Second
+				}
+				selector = coreauth.NewSmartStickySelectorWithRedis(coreauth.RedisOptions{
+					Addr:     sti.RedisAddr,
+					Password: sti.RedisPassword,
+					DB:       sti.RedisDB,
+					Prefix:   sti.RedisPrefix,
+					TTL:      ttl,
+				})
+			}
+		}
+		if selector == nil {
+			selector = coreauth.NewSmartStickySelector()
+		}
+		coreManager = coreauth.NewManager(tokenStore, selector, nil)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())

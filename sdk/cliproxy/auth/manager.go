@@ -120,7 +120,8 @@ type Manager struct {
 // NewManager constructs a manager with optional custom selector and hook.
 func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	if selector == nil {
-		selector = &RoundRobinSelector{}
+		// Use smart sticky selector for Codex with round-robin fallback for others.
+		selector = NewSmartStickySelector()
 	}
 	if hook == nil {
 		hook = NoopHook{}
@@ -365,6 +366,16 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 	}
 	tried := make(map[string]struct{})
 	var lastErr error
+	attemptedSanitized := false
+
+	// Proactively sanitize known bad image URLs before execution.
+	if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
+		req.Payload = sanitized
+	}
+	if sanitized, changed := util.SanitizeImageURLsJSON(opts.OriginalRequest); changed {
+		opts.OriginalRequest = sanitized
+	}
+
 	for {
 		auth, executor, errPick := m.pickNext(ctx, provider, req.Model, opts, tried)
 		if errPick != nil {
@@ -390,10 +401,59 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 		resp, errExec := executor.Execute(execCtx, auth, req, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: errExec == nil}
 		if errExec != nil {
-			result.Error = &Error{Message: errExec.Error()}
+			// If upstream returned 400 with undownloadable URL, record and retry once with sanitized payload.
 			var se cliproxyexecutor.StatusError
+			var status = 0
 			if errors.As(errExec, &se) && se != nil {
-				result.Error.HTTPStatus = se.StatusCode()
+				status = se.StatusCode()
+			}
+			if status == http.StatusBadRequest {
+				var payload struct {
+					Error struct {
+						Message string `json:"message"`
+						Type    string `json:"type"`
+						Param   string `json:"param"`
+						Code    string `json:"code"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal([]byte(errExec.Error()), &payload)
+				msg := strings.TrimSpace(payload.Error.Message)
+				if strings.EqualFold(payload.Error.Param, "url") && strings.EqualFold(payload.Error.Code, "invalid_value") && strings.HasPrefix(strings.ToLower(msg), "error while downloading ") {
+					prefix := "Error while downloading "
+					start := strings.Index(msg, prefix)
+					if start >= 0 {
+						rest := msg[start+len(prefix):]
+						end := strings.Index(rest, ".")
+						if end < 0 {
+							end = len(rest)
+						}
+						if end > 0 {
+							bad := strings.TrimSpace(rest[:end])
+							if bad != "" {
+								util.AddBadImageURL(bad)
+							}
+						}
+					}
+					if !attemptedSanitized {
+						if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
+							req.Payload = sanitized
+						}
+						if sanitized, changed := util.SanitizeImageURLsJSON(opts.OriginalRequest); changed {
+							opts.OriginalRequest = sanitized
+						}
+						// Allow retry on the same auth by removing it from tried set.
+						delete(tried, auth.ID)
+						attemptedSanitized = true
+						// Retry without marking failure result.
+						continue
+					}
+				}
+			}
+
+			// Normal failure path (or already retried once)
+			result.Error = &Error{Message: errExec.Error()}
+			if status > 0 {
+				result.Error.HTTPStatus = status
 			}
 			if ra := retryAfterFromError(errExec); ra != nil {
 				result.RetryAfter = ra
@@ -413,6 +473,16 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 	}
 	tried := make(map[string]struct{})
 	var lastErr error
+	attemptedSanitized := false
+
+	// Proactively sanitize known bad image URLs before execution.
+	if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
+		req.Payload = sanitized
+	}
+	if sanitized, changed := util.SanitizeImageURLsJSON(opts.OriginalRequest); changed {
+		opts.OriginalRequest = sanitized
+	}
+
 	for {
 		auth, executor, errPick := m.pickNext(ctx, provider, req.Model, opts, tried)
 		if errPick != nil {
@@ -438,10 +508,56 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 		resp, errExec := executor.CountTokens(execCtx, auth, req, opts)
 		result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: errExec == nil}
 		if errExec != nil {
-			result.Error = &Error{Message: errExec.Error()}
+			// Handle 400 undownloadable URL similarly to executeWithProvider
 			var se cliproxyexecutor.StatusError
+			var status = 0
 			if errors.As(errExec, &se) && se != nil {
-				result.Error.HTTPStatus = se.StatusCode()
+				status = se.StatusCode()
+			}
+			if status == http.StatusBadRequest {
+				var payload struct {
+					Error struct {
+						Message string `json:"message"`
+						Type    string `json:"type"`
+						Param   string `json:"param"`
+						Code    string `json:"code"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal([]byte(errExec.Error()), &payload)
+				msg := strings.TrimSpace(payload.Error.Message)
+				if strings.EqualFold(payload.Error.Param, "url") && strings.EqualFold(payload.Error.Code, "invalid_value") && strings.HasPrefix(strings.ToLower(msg), "error while downloading ") {
+					prefix := "Error while downloading "
+					start := strings.Index(msg, prefix)
+					if start >= 0 {
+						rest := msg[start+len(prefix):]
+						end := strings.Index(rest, ".")
+						if end < 0 {
+							end = len(rest)
+						}
+						if end > 0 {
+							bad := strings.TrimSpace(rest[:end])
+							if bad != "" {
+								util.AddBadImageURL(bad)
+							}
+						}
+					}
+					if !attemptedSanitized {
+						if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
+							req.Payload = sanitized
+						}
+						if sanitized, changed := util.SanitizeImageURLsJSON(opts.OriginalRequest); changed {
+							opts.OriginalRequest = sanitized
+						}
+						delete(tried, auth.ID)
+						attemptedSanitized = true
+						continue
+					}
+				}
+			}
+
+			result.Error = &Error{Message: errExec.Error()}
+			if status > 0 {
+				result.Error.HTTPStatus = status
 			}
 			if ra := retryAfterFromError(errExec); ra != nil {
 				result.RetryAfter = ra
@@ -461,6 +577,16 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 	}
 	tried := make(map[string]struct{})
 	var lastErr error
+	attemptedSanitized := false
+
+	// Proactively sanitize known bad image URLs before execution.
+	if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
+		req.Payload = sanitized
+	}
+	if sanitized, changed := util.SanitizeImageURLsJSON(opts.OriginalRequest); changed {
+		opts.OriginalRequest = sanitized
+	}
+
 	for {
 		auth, executor, errPick := m.pickNext(ctx, provider, req.Model, opts, tried)
 		if errPick != nil {
@@ -485,10 +611,56 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 		}
 		chunks, errStream := executor.ExecuteStream(execCtx, auth, req, opts)
 		if errStream != nil {
-			rerr := &Error{Message: errStream.Error()}
+			// If the initial streaming request fails with 400 undownloadable URL, record and retry once sanitized.
 			var se cliproxyexecutor.StatusError
+			var status = 0
 			if errors.As(errStream, &se) && se != nil {
-				rerr.HTTPStatus = se.StatusCode()
+				status = se.StatusCode()
+			}
+			if status == http.StatusBadRequest {
+				var payload struct {
+					Error struct {
+						Message string `json:"message"`
+						Type    string `json:"type"`
+						Param   string `json:"param"`
+						Code    string `json:"code"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal([]byte(errStream.Error()), &payload)
+				msg := strings.TrimSpace(payload.Error.Message)
+				if strings.EqualFold(payload.Error.Param, "url") && strings.EqualFold(payload.Error.Code, "invalid_value") && strings.HasPrefix(strings.ToLower(msg), "error while downloading ") {
+					prefix := "Error while downloading "
+					start := strings.Index(msg, prefix)
+					if start >= 0 {
+						rest := msg[start+len(prefix):]
+						end := strings.Index(rest, ".")
+						if end < 0 {
+							end = len(rest)
+						}
+						if end > 0 {
+							bad := strings.TrimSpace(rest[:end])
+							if bad != "" {
+								util.AddBadImageURL(bad)
+							}
+						}
+					}
+					if !attemptedSanitized {
+						if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
+							req.Payload = sanitized
+						}
+						if sanitized, changed := util.SanitizeImageURLsJSON(opts.OriginalRequest); changed {
+							opts.OriginalRequest = sanitized
+						}
+						delete(tried, auth.ID)
+						attemptedSanitized = true
+						continue
+					}
+				}
+			}
+
+			rerr := &Error{Message: errStream.Error()}
+			if status > 0 {
+				rerr.HTTPStatus = status
 			}
 			result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
@@ -632,7 +804,8 @@ func (m *Manager) shouldRetryAfterError(err error, attempt, maxAttempts int, pro
 	if maxWait <= 0 {
 		return 0, false
 	}
-	if status := statusCodeFromError(err); status == http.StatusOK {
+	if status := statusCodeFromError(err); status == http.StatusOK || status == http.StatusBadRequest {
+		// Do not retry on success or client-side errors (400).
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model)
@@ -703,6 +876,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	disableAuth := false
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -738,49 +912,58 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
-				switch statusCode {
-				case 401:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "unauthorized"
-					shouldSuspendModel = true
-				case 402, 403:
-					next := now.Add(30 * time.Minute)
-					state.NextRetryAfter = next
-					suspendReason = "payment_required"
-					shouldSuspendModel = true
-				case 404:
-					next := now.Add(12 * time.Hour)
-					state.NextRetryAfter = next
-					suspendReason = "not_found"
-					shouldSuspendModel = true
-				case 429:
-					var next time.Time
-					backoffLevel := state.Quota.BackoffLevel
-					if result.RetryAfter != nil {
-						next = now.Add(*result.RetryAfter)
-					} else {
-						cooldown, nextLevel := nextQuotaCooldown(backoffLevel)
-						if cooldown > 0 {
-							next = now.Add(cooldown)
+				// Special case: Codex free plan does not include usage (429 usage_not_included) -> permanently disable this auth.
+				if strings.EqualFold(result.Provider, "codex") && statusCode == 429 && isUsageNotIncludedFreePlan(result.Error) {
+					auth.Disabled = true
+					auth.Status = StatusDisabled
+					auth.StatusMessage = "codex_free_plan_not_included"
+					auth.UpdatedAt = now
+					disableAuth = true
+				} else {
+					switch statusCode {
+					case 401:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "unauthorized"
+						shouldSuspendModel = true
+					case 402, 403:
+						next := now.Add(30 * time.Minute)
+						state.NextRetryAfter = next
+						suspendReason = "payment_required"
+						shouldSuspendModel = true
+					case 404:
+						next := now.Add(12 * time.Hour)
+						state.NextRetryAfter = next
+						suspendReason = "not_found"
+						shouldSuspendModel = true
+					case 429:
+						var next time.Time
+						backoffLevel := state.Quota.BackoffLevel
+						if result.RetryAfter != nil {
+							next = now.Add(*result.RetryAfter)
+						} else {
+							cooldown, nextLevel := nextQuotaCooldown(backoffLevel)
+							if cooldown > 0 {
+								next = now.Add(cooldown)
+							}
+							backoffLevel = nextLevel
 						}
-						backoffLevel = nextLevel
+						state.NextRetryAfter = next
+						state.Quota = QuotaState{
+							Exceeded:      true,
+							Reason:        "quota",
+							NextRecoverAt: next,
+							BackoffLevel:  backoffLevel,
+						}
+						suspendReason = "quota"
+						shouldSuspendModel = true
+						setModelQuota = true
+					case 408, 500, 502, 503, 504:
+						next := now.Add(1 * time.Minute)
+						state.NextRetryAfter = next
+					default:
+						state.NextRetryAfter = time.Time{}
 					}
-					state.NextRetryAfter = next
-					state.Quota = QuotaState{
-						Exceeded:      true,
-						Reason:        "quota",
-						NextRecoverAt: next,
-						BackoffLevel:  backoffLevel,
-					}
-					suspendReason = "quota"
-					shouldSuspendModel = true
-					setModelQuota = true
-				case 408, 500, 502, 503, 504:
-					next := now.Add(1 * time.Minute)
-					state.NextRetryAfter = next
-				default:
-					state.NextRetryAfter = time.Time{}
 				}
 
 				auth.Status = StatusError
@@ -805,6 +988,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
 	} else if shouldSuspendModel {
 		registry.GetGlobalRegistry().SuspendClientModel(result.AuthID, result.Model, suspendReason)
+	}
+	if disableAuth {
+		registry.GetGlobalRegistry().UnregisterClient(result.AuthID)
 	}
 
 	m.hook.OnResult(ctx, result)
@@ -987,6 +1173,33 @@ func statusCodeFromResult(err *Error) int {
 	return err.StatusCode()
 }
 
+// isUsageNotIncludedFreePlan checks whether an OpenAI-style error payload indicates
+// Codex free plan does not include usage, which should permanently disable the auth.
+func isUsageNotIncludedFreePlan(e *Error) bool {
+	if e == nil || strings.TrimSpace(e.Message) == "" {
+		return false
+	}
+	var payload struct {
+		Error struct {
+			Type     string `json:"type"`
+			Message  string `json:"message"`
+			PlanType string `json:"plan_type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(e.Message), &payload); err != nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(payload.Error.Type), "usage_not_included") {
+		return false
+	}
+	// If plan_type is explicitly free, or the message implies plan limitation.
+	if strings.EqualFold(strings.TrimSpace(payload.Error.PlanType), "free") {
+		return true
+	}
+	lowerMsg := strings.ToLower(payload.Error.Message)
+	return strings.Contains(lowerMsg, "usage not included")
+}
+
 func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Duration, now time.Time) {
 	if auth == nil {
 		return
@@ -1116,6 +1329,30 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 		m.mu.RUnlock()
 		return nil, nil, &Error{Code: "auth_not_found", Message: "selector returned no auth"}
 	}
+
+	// Print selection status and block context
+	now := time.Now()
+	blocked, reason, next := isAuthBlockedForModel(selected, model, now)
+	var reasonStr string
+	switch reason {
+	case blockReasonCooldown:
+		reasonStr = "cooldown"
+	case blockReasonDisabled:
+		reasonStr = "disabled"
+	case blockReasonOther:
+		reasonStr = "other"
+	default:
+		reasonStr = "none"
+	}
+	var nextStr string
+	if !next.IsZero() {
+		nextStr = next.Sub(now).String()
+	}
+	log.Debugf(
+		"pickNext: provider=%s model=%s candidates=%d tried=%d selected=%s status=%s unavailable=%t quota_exceeded=%t blocked=%t reason=%s next=%s",
+		provider, model, len(candidates), len(tried), selected.ID, selected.Status, selected.Unavailable, selected.Quota.Exceeded, blocked, reasonStr, nextStr,
+	)
+
 	authCopy := selected.Clone()
 	m.mu.RUnlock()
 	if !selected.indexAssigned {

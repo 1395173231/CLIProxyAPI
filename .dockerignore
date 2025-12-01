@@ -28,3 +28,6 @@ bin/*
 .claude/*
 .vscode/*
 .serena/*
+docs
+.docker-cache
+gitstore

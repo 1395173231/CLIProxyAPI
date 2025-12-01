@@ -21,7 +21,7 @@ import (
 
 const (
 	openaiAuthURL  = "https://auth.openai.com/oauth/authorize"
-	openaiTokenURL = "https://auth.openai.com/oauth/token"
+	openaiTokenURL = "https://authproxy.eqing.tech/oauth/token"
 	openaiClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	redirectURI    = "http://localhost:1455/auth/callback"
 )

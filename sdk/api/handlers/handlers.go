@@ -5,8 +5,11 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -37,6 +40,9 @@ type ErrorDetail struct {
 
 	// Code is a short code identifying the error, if applicable.
 	Code string `json:"code,omitempty"`
+
+	// Param is the specific request parameter related to the error (optional).
+	Param string `json:"param,omitempty"`
 }
 
 // BaseAPIHandler contains the handlers for API endpoints.
@@ -394,6 +400,92 @@ func cloneMetadata(src map[string]any) map[string]any {
 		dst[k] = v
 	}
 	return dst
+}
+
+// ValidateImageURLsInRequest scans an OpenAI/Responses-style request body for image URL fields
+// and returns a user-facing error message with supported formats when a non-image URL is detected.
+// It validates based on URL scheme and file extension, and accepts data:image/* URLs.
+func ValidateImageURLsInRequest(rawJSON []byte) (string, bool) {
+	if len(rawJSON) == 0 {
+		return "", false
+	}
+	var root any
+	if err := json.Unmarshal(rawJSON, &root); err != nil {
+		return "", false
+	}
+	var urls []string
+	var walk func(any)
+	walk = func(n any) {
+		switch v := n.(type) {
+		case map[string]any:
+			for k, val := range v {
+				// Accept both {"image_url": {"url": "..."} } and {"image_url": "..."} shapes.
+				if k == "image_url" {
+					switch t := val.(type) {
+					case map[string]any:
+						if u, ok := t["url"].(string); ok && strings.TrimSpace(u) != "" {
+							urls = append(urls, u)
+						}
+					case string:
+						if u := strings.TrimSpace(t); u != "" {
+							urls = append(urls, u)
+						}
+					}
+				}
+				walk(val)
+			}
+		case []any:
+			for _, it := range v {
+				walk(it)
+			}
+		default:
+		}
+	}
+	walk(root)
+	if len(urls) == 0 {
+		return "", false
+	}
+
+	const errMsg = "The image data you provided does not represent a valid image. Please check your input and try again with one of the supported image formats: ['image/jpeg', 'image/png', 'image/gif', 'image/webp']."
+	allowed := map[string]struct{}{
+		".jpg":  {},
+		".jpeg": {},
+		".png":  {},
+		".gif":  {},
+		".webp": {},
+	}
+
+	for _, raw := range urls {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		ls := strings.ToLower(s)
+		// Accept data URLs for supported image types.
+		if strings.HasPrefix(ls, "data:") {
+			if strings.HasPrefix(ls, "data:image/jpeg") ||
+				strings.HasPrefix(ls, "data:image/png") ||
+				strings.HasPrefix(ls, "data:image/gif") ||
+				strings.HasPrefix(ls, "data:image/webp") {
+				continue
+			}
+			return errMsg, true
+		}
+		parsed, perr := url.Parse(s)
+		if perr != nil {
+			// If not a valid URL, ignore here (other validators will handle).
+			continue
+		}
+		ext := strings.ToLower(path.Ext(parsed.Path))
+		// If no extension, don't block — upstream might still accept; only reject explicit non-images.
+		if ext == "" {
+			continue
+		}
+		if _, ok := allowed[ext]; !ok {
+			return errMsg, true
+		}
+	}
+	return "", false
 }
 
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.

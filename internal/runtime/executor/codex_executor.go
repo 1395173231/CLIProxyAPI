@@ -467,6 +467,21 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	}
 	var refreshToken string
 	if auth.Metadata != nil {
+		if accessToken, ok := auth.Metadata["access_token"].(string); ok {
+			if tok, err := util.CheckToken(accessToken); err == nil {
+				if claim, ok := (*tok).Claims.(*util.CodexClaim); ok {
+					now := time.Now().Unix()
+					if claim.Exp > (now + 60*60) {
+						auth.Metadata["email"] = claim.HttpsApiOpenaiComProfile.Email
+						auth.Metadata["account_id"] = claim.HttpsApiOpenaiComAuth.ChatgptAccountId
+						// Use unified key in files
+						auth.Metadata["expired"] = claim.Exp
+						auth.Metadata["type"] = "codex"
+						return auth, nil
+					}
+				}
+			}
+		}
 		if v, ok := auth.Metadata["refresh_token"].(string); ok && v != "" {
 			refreshToken = v
 		}
@@ -557,6 +572,13 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string) {
 	if !isAPIKey {
 		r.Header.Set("Originator", "codex_cli_rs")
 		if auth != nil && auth.Metadata != nil {
+			if tok, err := util.CheckToken(token); err == nil {
+				if claim, ok := (*tok).Claims.(*util.CodexClaim); ok {
+					auth.Metadata["email"] = claim.HttpsApiOpenaiComProfile.Email
+					auth.Metadata["account_id"] = claim.HttpsApiOpenaiComAuth.ChatgptAccountId
+					// Use unified key in files
+				}
+			}
 			if accountID, ok := auth.Metadata["account_id"].(string); ok {
 				r.Header.Set("Chatgpt-Account-Id", accountID)
 			}

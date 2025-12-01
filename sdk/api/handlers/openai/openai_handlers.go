@@ -107,6 +107,19 @@ func (h *OpenAIAPIHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Early validation: reject non-image file URLs in image inputs.
+	if msg, bad := handlers.ValidateImageURLsInRequest(rawJSON); bad {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: msg,
+				Type:    "invalid_request_error",
+				Param:   "input",
+				Code:    "invalid_value",
+			},
+		})
+		return
+	}
+
 	// Check if the client requested a streaming response.
 	streamResult := gjson.GetBytes(rawJSON, "stream")
 	if streamResult.Type == gjson.True {

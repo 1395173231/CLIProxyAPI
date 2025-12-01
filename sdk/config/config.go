@@ -17,6 +17,10 @@ type SDKConfig struct {
 
 	// Access holds request authentication provider configuration.
 	Access AccessConfig `yaml:"auth,omitempty" json:"auth,omitempty"`
+
+	// StickyIndex configures optional persistence for the low-memory message index
+	// used by SmartStickySelector to keep sticky routing across restarts.
+	StickyIndex StickyIndexConfig `yaml:"sticky-index,omitempty" json:"sticky-index,omitempty"`
 }
 
 // AccessConfig groups request authentication providers.
@@ -43,13 +47,29 @@ type AccessProvider struct {
 	Config map[string]any `yaml:"config,omitempty" json:"config,omitempty"`
 }
 
-const (
-	// AccessProviderTypeConfigAPIKey is the built-in provider validating inline API keys.
-	AccessProviderTypeConfigAPIKey = "config-api-key"
-
-	// DefaultAccessProviderName is applied when no provider name is supplied.
-	DefaultAccessProviderName = "config-inline"
-)
+ // StickyIndexConfig defines optional Redis persistence for sticky routing.
+ type StickyIndexConfig struct {
+ 	// RedisEnabled toggles Redis-backed persistence.
+ 	RedisEnabled bool `yaml:"redis-enabled" json:"redis-enabled"`
+ 	// RedisAddr is host:port (e.g., "127.0.0.1:6379").
+ 	RedisAddr string `yaml:"redis-addr,omitempty" json:"redis-addr,omitempty"`
+ 	// RedisPassword optional password.
+ 	RedisPassword string `yaml:"redis-password,omitempty" json:"redis-password,omitempty"`
+ 	// RedisDB database index.
+ 	RedisDB int `yaml:"redis-db,omitempty" json:"redis-db,omitempty"`
+ 	// RedisPrefix key prefix (default "msgidx").
+ 	RedisPrefix string `yaml:"redis-prefix,omitempty" json:"redis-prefix,omitempty"`
+ 	// TTLSeconds expiration in seconds for bindings; <=0 uses default.
+ 	TTLSeconds int `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
+ }
+ 
+ const (
+ 	// AccessProviderTypeConfigAPIKey is the built-in provider validating inline API keys.
+ 	AccessProviderTypeConfigAPIKey = "config-api-key"
+ 
+ 	// DefaultAccessProviderName is applied when no provider name is supplied.
+ 	DefaultAccessProviderName = "config-inline"
+ )
 
 // ConfigAPIKeyProvider returns the first inline API key provider if present.
 func (c *SDKConfig) ConfigAPIKeyProvider() *AccessProvider {
