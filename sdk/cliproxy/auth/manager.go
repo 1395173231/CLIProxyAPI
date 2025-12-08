@@ -237,6 +237,10 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		// Skip permanently disabled auths so they are not resurrected after restart.
+		if auth.Disabled {
+			continue
+		}
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
@@ -367,7 +371,6 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 	tried := make(map[string]struct{})
 	var lastErr error
 	attemptedSanitized := false
-
 	// Proactively sanitize known bad image URLs before execution.
 	if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
 		req.Payload = sanitized
@@ -423,16 +426,8 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 					start := strings.Index(msg, prefix)
 					if start >= 0 {
 						rest := msg[start+len(prefix):]
-						end := strings.Index(rest, ".")
-						if end < 0 {
-							end = len(rest)
-						}
-						if end > 0 {
-							bad := strings.TrimSpace(rest[:end])
-							if bad != "" {
-								util.AddBadImageURL(bad)
-							}
-						}
+						bad := strings.TrimSuffix(rest, ".")
+						util.AddBadImageURL(bad)
 					}
 					if !attemptedSanitized {
 						if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
@@ -448,6 +443,22 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 						continue
 					}
 				}
+				// For other 400 invalid request errors (e.g., wrong params), fail fast without trying other auths.
+				result.Error = &Error{Message: errExec.Error()}
+				if status > 0 {
+					result.Error.HTTPStatus = status
+				}
+				if ra := retryAfterFromError(errExec); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(execCtx, result)
+				lastErr = errExec
+				if status == http.StatusUnauthorized {
+					// Try to refresh credentials once; disable on failure, then switch auth.
+					m.refreshAfterUnauthorized(execCtx, auth.ID)
+					continue
+				}
+				return cliproxyexecutor.Response{}, errExec
 			}
 
 			// Normal failure path (or already retried once)
@@ -460,9 +471,15 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 			}
 			m.MarkResult(execCtx, result)
 			lastErr = errExec
-			continue
+			if status == http.StatusUnauthorized {
+				// Try to refresh credentials once; disable on failure, then switch auth.
+				m.refreshAfterUnauthorized(execCtx, auth.ID)
+				continue
+			}
+			return cliproxyexecutor.Response{}, errExec
 		}
 		m.MarkResult(execCtx, result)
+		m.recordStickyOnSuccess(provider, req.Model, opts, auth.ID)
 		return resp, nil
 	}
 }
@@ -530,16 +547,8 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 					start := strings.Index(msg, prefix)
 					if start >= 0 {
 						rest := msg[start+len(prefix):]
-						end := strings.Index(rest, ".")
-						if end < 0 {
-							end = len(rest)
-						}
-						if end > 0 {
-							bad := strings.TrimSpace(rest[:end])
-							if bad != "" {
-								util.AddBadImageURL(bad)
-							}
-						}
+						bad := strings.TrimSuffix(rest, ".")
+						util.AddBadImageURL(bad)
 					}
 					if !attemptedSanitized {
 						if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
@@ -553,6 +562,22 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 						continue
 					}
 				}
+				// For other 400 invalid request errors, fail fast for CountTokens too.
+				result.Error = &Error{Message: errExec.Error()}
+				if status > 0 {
+					result.Error.HTTPStatus = status
+				}
+				if ra := retryAfterFromError(errExec); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(execCtx, result)
+				lastErr = errExec
+				if status == http.StatusUnauthorized {
+					// Try to refresh credentials once; disable on failure, then switch auth.
+					m.refreshAfterUnauthorized(execCtx, auth.ID)
+					continue
+				}
+				return cliproxyexecutor.Response{}, errExec
 			}
 
 			result.Error = &Error{Message: errExec.Error()}
@@ -564,9 +589,15 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 			}
 			m.MarkResult(execCtx, result)
 			lastErr = errExec
-			continue
+			if status == http.StatusUnauthorized {
+				// Try to refresh credentials once; disable on failure, then switch auth.
+				m.refreshAfterUnauthorized(execCtx, auth.ID)
+				continue
+			}
+			return cliproxyexecutor.Response{}, errExec
 		}
 		m.MarkResult(execCtx, result)
+		m.recordStickyOnSuccess(provider, req.Model, opts, auth.ID)
 		return resp, nil
 	}
 }
@@ -633,16 +664,8 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 					start := strings.Index(msg, prefix)
 					if start >= 0 {
 						rest := msg[start+len(prefix):]
-						end := strings.Index(rest, ".")
-						if end < 0 {
-							end = len(rest)
-						}
-						if end > 0 {
-							bad := strings.TrimSpace(rest[:end])
-							if bad != "" {
-								util.AddBadImageURL(bad)
-							}
-						}
+						bad := strings.TrimSuffix(rest, ".")
+						util.AddBadImageURL(bad)
 					}
 					if !attemptedSanitized {
 						if sanitized, changed := util.SanitizeImageURLsJSON(req.Payload); changed {
@@ -655,7 +678,23 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 						attemptedSanitized = true
 						continue
 					}
+
 				}
+				// For other 400 invalid request errors in streaming, fail fast.
+				rerr := &Error{Message: errStream.Error()}
+				if status > 0 {
+					rerr.HTTPStatus = status
+				}
+				result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: false, Error: rerr}
+				result.RetryAfter = retryAfterFromError(errStream)
+				m.MarkResult(execCtx, result)
+				lastErr = errStream
+				if status == http.StatusUnauthorized {
+					// Try to refresh credentials once; disable on failure, then switch auth.
+					m.refreshAfterUnauthorized(execCtx, auth.ID)
+					continue
+				}
+				return nil, errStream
 			}
 
 			rerr := &Error{Message: errStream.Error()}
@@ -666,7 +705,12 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(execCtx, result)
 			lastErr = errStream
-			continue
+			if status == http.StatusUnauthorized {
+				// Try to refresh credentials once; disable on failure, then switch auth.
+				m.refreshAfterUnauthorized(execCtx, auth.ID)
+				continue
+			}
+			return nil, lastErr
 		}
 		out := make(chan cliproxyexecutor.StreamChunk)
 		go func(streamCtx context.Context, streamAuth *Auth, streamProvider string, streamChunks <-chan cliproxyexecutor.StreamChunk) {
@@ -685,6 +729,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 				out <- chunk
 			}
 			if !failed {
+				m.recordStickyOnSuccess(streamProvider, req.Model, opts, streamAuth.ID)
 				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: req.Model, Success: true})
 			}
 		}(execCtx, auth.Clone(), provider, chunks)
@@ -912,6 +957,72 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
+
+				// Special case: Codex payment_required (402) – permanently disable all creds sharing the same account_id.
+				if strings.EqualFold(result.Provider, "codex") && statusCode == http.StatusPaymentRequired {
+					var accountID string
+					if auth.Metadata != nil {
+						if v, ok := auth.Metadata["account_id"].(string); ok {
+							accountID = strings.TrimSpace(v)
+						} else if v, ok := auth.Metadata["access_token"].(string); ok {
+							token := strings.TrimSpace(v)
+							if token != "" {
+								if tok, err := util.CheckToken(token); err == nil {
+									if claim, ok := (*tok).Claims.(*util.CodexClaim); ok {
+										email := strings.TrimSpace(claim.HttpsApiOpenaiComProfile.Email)
+										accID := strings.TrimSpace(claim.HttpsApiOpenaiComAuth.ChatgptAccountId)
+										if email != "" {
+											auth.Metadata["email"] = email
+										}
+										if accID != "" {
+											auth.Metadata["account_id"] = accID
+											accountID = accID
+										}
+									}
+								}
+							}
+						}
+					}
+					for _, other := range m.auths {
+						if other == nil || other.Disabled {
+							continue
+						}
+						if !strings.EqualFold(other.Provider, auth.Provider) {
+							continue
+						}
+						if accountID != "" {
+							if other.Metadata == nil {
+								continue
+							}
+							v, ok := other.Metadata["account_id"].(string)
+							if !ok || strings.TrimSpace(v) != accountID {
+								continue
+							}
+						} else if other.ID != auth.ID {
+							continue
+						}
+						stateOther := ensureModelState(other, result.Model)
+						if stateOther != nil {
+							stateOther.Unavailable = true
+							stateOther.Status = StatusDisabled
+							stateOther.StatusMessage = "payment_required"
+							stateOther.NextRetryAfter = time.Time{}
+						}
+						other.Disabled = true
+						other.Status = StatusDisabled
+						if strings.TrimSpace(other.StatusMessage) == "" {
+							other.StatusMessage = "payment_required"
+						}
+						other.UpdatedAt = now
+						updateAggregatedAvailability(other, now)
+						_ = m.persist(ctx, other)
+						registry.GetGlobalRegistry().UnregisterClient(other.ID)
+					}
+					// Prevent generic 402 handling below.
+					statusCode = 0
+					disableAuth = true
+				}
+
 				// Special case: Codex free plan does not include usage (429 usage_not_included) -> permanently disable this auth.
 				if strings.EqualFold(result.Provider, "codex") && statusCode == 429 && isUsageNotIncludedFreePlan(result.Error) {
 					auth.Disabled = true
@@ -922,12 +1033,12 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				} else {
 					switch statusCode {
 					case 401:
-						next := now.Add(30 * time.Minute)
+						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "unauthorized"
 						shouldSuspendModel = true
 					case 402, 403:
-						next := now.Add(30 * time.Minute)
+						next := now.Add(12 * time.Hour)
 						state.NextRetryAfter = next
 						suspendReason = "payment_required"
 						shouldSuspendModel = true
@@ -1714,6 +1825,63 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	_, _ = m.Update(ctx, updated)
 }
 
+// refreshAfterUnauthorized attempts a one-off refresh after a 401 response.
+// If refresh fails, the auth is permanently disabled and unregistered.
+func (m *Manager) refreshAfterUnauthorized(ctx context.Context, id string) {
+	m.mu.RLock()
+	auth := m.auths[id]
+	var exec ProviderExecutor
+	if auth != nil {
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+	if auth == nil || exec == nil {
+		return
+	}
+	cloned := auth.Clone()
+	// For Codex, force a true refresh by removing any cached access_token on the cloned auth.
+	// This prevents refresh logic from short-circuiting based on a still-valid JWT and
+	// ensures that the underlying executor uses the refresh_token path instead.
+	if cloned != nil && strings.EqualFold(auth.Provider, "codex") {
+		if cloned.Metadata == nil {
+			cloned.Metadata = make(map[string]any)
+		}
+		delete(cloned.Metadata, "access_token")
+	}
+	updated, err := exec.Refresh(ctx, cloned)
+	log.Debugf("refresh after unauthorized %s, %s, %v", auth.Provider, auth.ID, err)
+	now := time.Now()
+	if err != nil {
+		m.mu.Lock()
+		if current := m.auths[id]; current != nil {
+			current.Disabled = true
+			current.Status = StatusDisabled
+			if strings.TrimSpace(current.StatusMessage) == "" {
+				current.StatusMessage = "unauthorized_refresh_failed"
+			}
+			current.UpdatedAt = now
+			m.auths[id] = current
+			_ = m.persist(ctx, current)
+		}
+		m.mu.Unlock()
+		registry.GetGlobalRegistry().UnregisterClient(id)
+		return
+	}
+	if updated == nil {
+		updated = cloned
+	}
+	// Preserve runtime created by the executor during Refresh.
+	// If executor didn't set one, fall back to the previous runtime.
+	if updated.Runtime == nil {
+		updated.Runtime = auth.Runtime
+	}
+	updated.LastRefreshedAt = now
+	updated.NextRefreshAfter = time.Time{}
+	updated.LastError = nil
+	updated.UpdatedAt = now
+	_, _ = m.Update(ctx, updated)
+}
+
 func (m *Manager) executorFor(provider string) ProviderExecutor {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -1732,6 +1900,28 @@ func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
 		return nil
 	}
 	return p.RoundTripperFor(auth)
+}
+
+// recordStickyOnSuccess records message-hash -> auth binding only after a successful request.
+// It is a no-op for non-Codex providers or when no message hashes are present.
+func (m *Manager) recordStickyOnSuccess(provider, model string, opts cliproxyexecutor.Options, authID string) {
+	if m == nil || strings.TrimSpace(provider) == "" || strings.TrimSpace(authID) == "" {
+		return
+	}
+	// Only sticky-route Codex; others remain round-robin.
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return
+	}
+	sel, ok := m.selector.(*SmartStickySelector)
+	if !ok || sel == nil || sel.idx == nil {
+		return
+	}
+	hashes := extractMessageHashes(opts.OriginalRequest)
+	if len(hashes) == 0 {
+		return
+	}
+	scope := strings.ToLower(strings.TrimSpace(provider))
+	sel.idx.Record(scope, hashes, strings.TrimSpace(authID))
 }
 
 // RoundTripperProvider defines a minimal provider of per-auth HTTP transports.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,8 +20,8 @@ import (
 // Rendezvous (highest-random-weight) hashing provides good balance and stability.
 type SmartStickySelector struct {
 	mu      sync.Mutex
-	offsets map[string]int // fallback round-robin cursor per (provider|model)
-	idx     messageIndexStore  // per-message hash -> auth binding index (memory or redis)
+	offsets map[string]int    // fallback round-robin cursor per (provider|model)
+	idx     messageIndexStore // per-message hash -> auth binding index (memory or redis)
 }
 
 // NewSmartStickySelector constructs a new sticky selector.
@@ -39,18 +40,50 @@ func NewSmartStickySelector() *SmartStickySelector {
 //
 // - Otherwise: round-robin.
 func (s *SmartStickySelector) Pick(_ context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
-	// Sanity
+	now := time.Now()
+
+	// Filter out disabled or cooling-down auths.
 	filtered := make([]*Auth, 0, len(auths))
+	cooldownCount := 0
+	var earliest time.Time
+	total := 0
 	for _, a := range auths {
-		if a != nil && !a.Disabled {
-			filtered = append(filtered, a)
+		if a == nil {
+			continue
 		}
+		total++
+		if a.Disabled {
+			continue
+		}
+		blocked, reason, next := isAuthBlockedForModel(a, model, now)
+		if blocked {
+			if reason == blockReasonCooldown {
+				cooldownCount++
+				if !next.IsZero() && (earliest.IsZero() || next.Before(earliest)) {
+					earliest = next
+				}
+			}
+			continue
+		}
+		filtered = append(filtered, a)
 	}
 	if len(filtered) == 0 {
+		if cooldownCount == total && !earliest.IsZero() {
+			resetIn := earliest.Sub(now)
+			if resetIn < 0 {
+				resetIn = 0
+			}
+			return nil, newModelCooldownError(model, provider, resetIn)
+		}
 		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 	}
 
-	scope := strings.ToLower(strings.TrimSpace(provider)) + "|" + strings.ToLower(strings.TrimSpace(model))
+	// Keep round-robin deterministic when using fallback.
+	if len(filtered) > 1 {
+		sort.Slice(filtered, func(i, j int) bool { return filtered[i].ID < filtered[j].ID })
+	}
+
+	scope := strings.ToLower(strings.TrimSpace(provider))
 	var chosen *Auth
 
 	// Sticky selection only for Codex
@@ -72,11 +105,8 @@ func (s *SmartStickySelector) Pick(_ context.Context, provider, model string, op
 			chosen = filtered[idx]
 		}
 
-		// 4) If chosen, record bindings and return
+		// 4) If chosen, return (recording occurs on successful execution)
 		if chosen != nil {
-			if len(msgHashes) > 0 && s.idx != nil {
-				s.idx.Record(scope, msgHashes, chosen.ID)
-			}
 			return chosen.Clone(), nil
 		}
 	}
@@ -148,6 +178,8 @@ type msgBinding struct {
 	AuthID   string
 	Count    int
 	LastSeen time.Time
+	Changes  uint8 // number of conflict flips observed
+	Stop     bool  // mark as unstable/public hash; ignore in voting
 }
 
 type messageIndex struct {
@@ -166,6 +198,10 @@ const (
 	indexMaxPerScope = 100_000       // hard cap per (provider|model)
 	indexTTL         = 6 * time.Hour // expire old bindings
 	indexScanGC      = 4_096         // max entries scanned per GC pass
+
+	// Sticky robustness controls
+	countMax        = 16 // saturation limit for binding inertia
+	stopHashChanges = 3  // conflict flips before marking a hash as Stop
 )
 
 // SuggestAuth proposes an auth whose messages overlap most with current hashes.
@@ -182,7 +218,7 @@ func (idx *messageIndex) SuggestAuth(scope string, msgHashes []uint64, auths []*
 	}
 	scores := make(map[string]int, 8)
 	for _, h := range msgHashes {
-		if b, ok := table[h]; ok && b != nil && b.AuthID != "" {
+		if b, ok := table[h]; ok && b != nil && b.AuthID != "" && !b.Stop {
 			scores[b.AuthID]++
 		}
 	}
@@ -199,7 +235,26 @@ func (idx *messageIndex) SuggestAuth(scope string, msgHashes []uint64, auths []*
 			bestID = id
 		}
 	}
-	// coverage threshold
+
+	// Absolute hit threshold: at least 2 distinct message matches
+	const minAbsHits = 2
+	if bestScore < minAbsHits {
+		return nil
+	}
+
+	// Single-message special gating: require strong historical evidence
+	if len(msgHashes) == 1 {
+		const requireCountForSingle = 3
+		h := msgHashes[0]
+		idx.mu.RLock()
+		b := table[h]
+		idx.mu.RUnlock()
+		if b == nil || b.AuthID != bestID || b.Count < requireCountForSingle || b.Stop {
+			return nil
+		}
+	}
+
+	// coverage threshold (retain existing heuristic)
 	minCover := 0
 	switch {
 	case len(msgHashes) >= 9:
@@ -238,20 +293,30 @@ func (idx *messageIndex) Record(scope string, msgHashes []uint64, authID string)
 	}
 	for _, h := range msgHashes {
 		if b, ok := table[h]; ok && b != nil {
+			// Ignore unstable/public hashes for reinforcement; only refresh LastSeen
+			if b.Stop {
+				b.LastSeen = now
+				continue
+			}
 			if b.AuthID == authID {
-				b.Count++
+				if b.Count < countMax {
+					b.Count++
+				}
 				b.LastSeen = now
 			} else {
-				// Keep the majority binding; lightly decay on conflict.
-				if b.Count <= 0 {
+				// Conflict: decay inertia and count flips; stop after repeated conflicts
+				if b.Count > 0 {
+					b.Count--
+					b.Changes++
+					if b.Changes >= stopHashChanges {
+						b.Stop = true
+					}
+				} else {
+					// Switch binding when previous evidence fully decayed
 					b.AuthID = authID
 					b.Count = 1
+					b.Changes = 0
 					b.LastSeen = now
-				} else {
-					b.Count--
-					if b.Count < 0 {
-						b.Count = 0
-					}
 				}
 			}
 		} else {
@@ -365,7 +430,8 @@ func extractMessageHashes(raw []byte) []uint64 {
 				}
 				role, _ := mm["role"].(string)
 				role = strings.ToLower(strings.TrimSpace(role))
-				if role != "user" && role != "system" && role != "" {
+				// Only allow user role to avoid cross-coupling via shared system prompts
+				if role != "user" {
 					continue
 				}
 				if c, ok := mm["content"]; ok {

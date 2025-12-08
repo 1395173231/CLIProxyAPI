@@ -5,16 +5,30 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	utils "github.com/router-for-me/CLIProxyAPI/v6/internal/utils"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 var statisticsEnabled atomic.Bool
+
+// Persistence state
+var (
+	persistPathMu    sync.RWMutex
+	persistPath      string
+	loadedFromDisk   atomic.Bool
+	autosaveCancelFn context.CancelFunc
+)
 
 func init() {
 	statisticsEnabled.Store(true)
@@ -346,4 +360,160 @@ func formatHour(hour int) string {
 	}
 	hour = hour % 24
 	return fmt.Sprintf("%02d", hour)
+}
+
+/***************
+Persistence API
+***************/
+
+// SetStatisticsPersistencePath configures a JSON file for persisting statistics.
+// It attempts to load existing data exactly once per process.
+func SetStatisticsPersistencePath(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	dir := filepath.Dir(path)
+	_ = os.MkdirAll(dir, 0o755)
+
+	persistPathMu.Lock()
+	persistPath = path
+	persistPathMu.Unlock()
+
+	if !loadedFromDisk.Load() {
+		if err := defaultRequestStatistics.Load(path); err == nil {
+			loadedFromDisk.Store(true)
+		}
+	}
+}
+
+// StartStatisticsAutosave starts a background autosave loop at the given interval.
+// Reinvoking replaces the previous loop.
+func StartStatisticsAutosave(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	// stop existing
+	if autosaveCancelFn != nil {
+		autosaveCancelFn()
+		autosaveCancelFn = nil
+	}
+	ctx1, cancel := context.WithCancel(ctx)
+	autosaveCancelFn = cancel
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx1.Done():
+				return
+			case <-ticker.C:
+				persistPathMu.RLock()
+				path := persistPath
+				persistPathMu.RUnlock()
+				if strings.TrimSpace(path) == "" {
+					continue
+				}
+				_ = defaultRequestStatistics.Save(path)
+			}
+		}
+	}()
+}
+
+// StopStatisticsAutosave stops the autosave loop if running.
+func StopStatisticsAutosave() {
+	if autosaveCancelFn != nil {
+		autosaveCancelFn()
+		autosaveCancelFn = nil
+	}
+}
+
+// Save writes the current snapshot to the provided path atomically.
+func (s *RequestStatistics) Save(path string) error {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(s.Snapshot(), "", "  ")
+	if err != nil {
+		return err
+	}
+	return utils.AtomicWrite(path, data)
+}
+
+// Load reads a snapshot from path and replaces the in-memory aggregates.
+func (s *RequestStatistics) Load(path string) error {
+	if s == nil || strings.TrimSpace(path) == "" {
+		return nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var snap StatisticsSnapshot
+	if err := json.Unmarshal(b, &snap); err != nil {
+		return err
+	}
+	s.applySnapshot(snap)
+	return nil
+}
+
+// applySnapshot replaces the current stats with the provided snapshot.
+func (s *RequestStatistics) applySnapshot(snap StatisticsSnapshot) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.totalRequests = snap.TotalRequests
+	s.successCount = snap.SuccessCount
+	s.failureCount = snap.FailureCount
+	s.totalTokens = snap.TotalTokens
+
+	s.apis = make(map[string]*apiStats, len(snap.APIs))
+	for apiKey, apiSnap := range snap.APIs {
+		as := &apiStats{
+			TotalRequests: apiSnap.TotalRequests,
+			TotalTokens:   apiSnap.TotalTokens,
+			Models:        make(map[string]*modelStats, len(apiSnap.Models)),
+		}
+		for model, msnap := range apiSnap.Models {
+			ms := &modelStats{
+				TotalRequests: msnap.TotalRequests,
+				TotalTokens:   msnap.TotalTokens,
+				Details:       make([]RequestDetail, len(msnap.Details)),
+			}
+			copy(ms.Details, msnap.Details)
+			as.Models[model] = ms
+		}
+		s.apis[apiKey] = as
+	}
+
+	// RequestsByDay/TokensByDay copied directly
+	s.requestsByDay = make(map[string]int64, len(snap.RequestsByDay))
+	for k, v := range snap.RequestsByDay {
+		s.requestsByDay[k] = v
+	}
+	s.tokensByDay = make(map[string]int64, len(snap.TokensByDay))
+	for k, v := range snap.TokensByDay {
+		s.tokensByDay[k] = v
+	}
+
+	// Hourly maps: convert "HH" keys back to int indices
+	s.requestsByHour = make(map[int]int64, len(snap.RequestsByHour))
+	for hk, v := range snap.RequestsByHour {
+		if i, err := strconv.Atoi(hk); err == nil {
+			s.requestsByHour[i%24] = v
+		}
+	}
+	s.tokensByHour = make(map[int]int64, len(snap.TokensByHour))
+	for hk, v := range snap.TokensByHour {
+		if i, err := strconv.Atoi(hk); err == nil {
+			s.tokensByHour[i%24] = v
+		}
+	}
 }

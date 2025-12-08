@@ -264,6 +264,10 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt.SetLogDirectory(logDir)
 	s.localPassword = optionState.localPassword
 
+	// Persist usage statistics to disk and autosave
+	usage.SetStatisticsPersistencePath(filepath.Join(logDir, "usage.json"))
+	usage.StartStatisticsAutosave(context.Background(), 30*time.Second)
+
 	// Setup routes
 	s.setupRoutes()
 
@@ -538,6 +542,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/codex-api-key", s.mgmt.PatchCodexKey)
 		mgmt.DELETE("/codex-api-key", s.mgmt.DeleteCodexKey)
 
+		mgmt.GET("/codex-usage", s.mgmt.GetCodexUsage)
+
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)
 		mgmt.PATCH("/openai-compatibility", s.mgmt.PatchOpenAICompat)
@@ -753,6 +759,14 @@ func (s *Server) Stop(ctx context.Context) error {
 	if err := s.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("failed to shutdown HTTP server: %v", err)
 	}
+
+	// Stop autosave and write a final snapshot
+	usage.StopStatisticsAutosave()
+	shutdownLogDir := filepath.Join(s.currentPath, "logs")
+	if base := util.WritablePath(); base != "" {
+		shutdownLogDir = filepath.Join(base, "logs")
+	}
+	_ = usage.GetRequestStatistics().Save(filepath.Join(shutdownLogDir, "usage.json"))
 
 	log.Debug("API server stopped")
 	return nil
