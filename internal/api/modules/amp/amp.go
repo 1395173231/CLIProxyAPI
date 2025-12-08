@@ -23,13 +23,24 @@ type Option func(*AmpModule)
 //   - Reverse proxy to Amp control plane for OAuth/management
 //   - Provider-specific route aliases (/api/provider/{provider}/...)
 //   - Automatic gzip decompression for misconfigured upstreams
+//   - Model mapping for routing unavailable models to alternatives
 type AmpModule struct {
 	secretSource    SecretSource
 	proxy           *httputil.ReverseProxy
+	proxyMu         sync.RWMutex // protects proxy for hot-reload
 	accessManager   *sdkaccess.Manager
 	authMiddleware_ gin.HandlerFunc
+	modelMapper     *DefaultModelMapper
 	enabled         bool
 	registerOnce    sync.Once
+
+	// restrictToLocalhost controls localhost-only access for management routes (hot-reloadable)
+	restrictToLocalhost bool
+	restrictMu          sync.RWMutex
+
+	// configMu protects lastConfig for partial reload comparison
+	configMu   sync.RWMutex
+	lastConfig *config.AmpCode
 }
 
 // New creates a new Amp routing module with the given options.
@@ -89,11 +100,22 @@ func (m *AmpModule) Name() string {
 	return "amp-routing"
 }
 
+// forceModelMappings returns whether model mappings should take precedence over local API keys
+func (m *AmpModule) forceModelMappings() bool {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	if m.lastConfig == nil {
+		return false
+	}
+	return m.lastConfig.ForceModelMappings
+}
+
 // Register sets up Amp routes if configured.
 // This implements the RouteModuleV2 interface with Context.
 // Routes are registered only once via sync.Once for idempotent behavior.
 func (m *AmpModule) Register(ctx modules.Context) error {
-	upstreamURL := strings.TrimSpace(ctx.Config.AmpUpstreamURL)
+	settings := ctx.Config.AmpCode
+	upstreamURL := strings.TrimSpace(settings.UpstreamURL)
 
 	// Determine auth middleware (from module or context)
 	auth := m.getAuthMiddleware(ctx)
@@ -101,40 +123,36 @@ func (m *AmpModule) Register(ctx modules.Context) error {
 	// Use registerOnce to ensure routes are only registered once
 	var regErr error
 	m.registerOnce.Do(func() {
+		// Initialize model mapper from config (for routing unavailable models to alternatives)
+		m.modelMapper = NewModelMapper(settings.ModelMappings)
+
+		// Store initial config for partial reload comparison
+		settingsCopy := settings
+		m.lastConfig = &settingsCopy
+
+		// Initialize localhost restriction setting (hot-reloadable)
+		m.setRestrictToLocalhost(settings.RestrictManagementToLocalhost)
+
 		// Always register provider aliases - these work without an upstream
 		m.registerProviderAliases(ctx.Engine, ctx.BaseHandler, auth)
 
+		// Register management proxy routes once; middleware will gate access when upstream is unavailable.
+		m.registerManagementRoutes(ctx.Engine, ctx.BaseHandler)
+
 		// If no upstream URL, skip proxy routes but provider aliases are still available
 		if upstreamURL == "" {
-			log.Debug("Amp upstream proxy disabled (no upstream URL configured)")
-			log.Debug("Amp provider alias routes registered")
+			log.Debug("amp upstream proxy disabled (no upstream URL configured)")
+			log.Debug("amp provider alias routes registered")
 			m.enabled = false
 			return
 		}
 
-		// Create secret source with precedence: config > env > file
-		// Cache secrets for 5 minutes to reduce file I/O
-		if m.secretSource == nil {
-			m.secretSource = NewMultiSourceSecret(ctx.Config.AmpUpstreamAPIKey, 0 /* default 5min */)
-		}
-
-		// Create reverse proxy with gzip handling via ModifyResponse
-		proxy, err := createReverseProxy(upstreamURL, m.secretSource)
-		if err != nil {
+		if err := m.enableUpstreamProxy(upstreamURL, &settings); err != nil {
 			regErr = fmt.Errorf("failed to create amp proxy: %w", err)
 			return
 		}
 
-		m.proxy = proxy
-		m.enabled = true
-
-		// Register management proxy routes (requires upstream)
-		// Restrict to localhost by default for security (prevents drive-by browser attacks)
-		handler := proxyHandler(proxy)
-		m.registerManagementRoutes(ctx.Engine, ctx.BaseHandler, handler, ctx.Config.AmpRestrictManagementToLocalhost)
-
-		log.Infof("Amp upstream proxy enabled for: %s", upstreamURL)
-		log.Debug("Amp provider alias routes registered")
+		log.Debug("amp provider alias routes registered")
 	})
 
 	return regErr
@@ -150,34 +168,175 @@ func (m *AmpModule) getAuthMiddleware(ctx modules.Context) gin.HandlerFunc {
 		return ctx.AuthMiddleware
 	}
 	// Fallback: no authentication (should not happen in production)
-	log.Warn("Amp module: no auth middleware provided, allowing all requests")
+	log.Warn("amp module: no auth middleware provided, allowing all requests")
 	return func(c *gin.Context) {
 		c.Next()
 	}
 }
 
-// OnConfigUpdated handles configuration updates.
-// Currently requires restart for URL changes (could be enhanced for dynamic updates).
+// OnConfigUpdated handles configuration updates with partial reload support.
+// Only updates components that have actually changed to avoid unnecessary work.
+// Supports hot-reload for: model-mappings, upstream-api-key, upstream-url, restrict-management-to-localhost.
 func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
-	if !m.enabled {
-		log.Debug("Amp routing not enabled, skipping config update")
-		return nil
-	}
+	newSettings := cfg.AmpCode
 
-	upstreamURL := strings.TrimSpace(cfg.AmpUpstreamURL)
-	if upstreamURL == "" {
-		log.Warn("Amp upstream URL removed from config, restart required to disable")
-		return nil
-	}
+	// Get previous config for comparison
+	m.configMu.RLock()
+	oldSettings := m.lastConfig
+	m.configMu.RUnlock()
 
-	// If API key changed, invalidate the cache
-	if m.secretSource != nil {
-		if ms, ok := m.secretSource.(*MultiSourceSecret); ok {
-			ms.InvalidateCache()
-			log.Debug("Amp secret cache invalidated due to config update")
+	if oldSettings != nil && oldSettings.RestrictManagementToLocalhost != newSettings.RestrictManagementToLocalhost {
+		m.setRestrictToLocalhost(newSettings.RestrictManagementToLocalhost)
+		if !newSettings.RestrictManagementToLocalhost {
+			log.Warnf("amp management routes now accessible from any IP - this is insecure!")
 		}
 	}
 
-	log.Debug("Amp config updated (restart required for URL changes)")
+	newUpstreamURL := strings.TrimSpace(newSettings.UpstreamURL)
+	oldUpstreamURL := ""
+	if oldSettings != nil {
+		oldUpstreamURL = strings.TrimSpace(oldSettings.UpstreamURL)
+	}
+
+	if !m.enabled && newUpstreamURL != "" {
+		if err := m.enableUpstreamProxy(newUpstreamURL, &newSettings); err != nil {
+			log.Errorf("amp config: failed to enable upstream proxy for %s: %v", newUpstreamURL, err)
+		}
+	}
+
+	// Check model mappings change
+	modelMappingsChanged := m.hasModelMappingsChanged(oldSettings, &newSettings)
+	if modelMappingsChanged {
+		if m.modelMapper != nil {
+			m.modelMapper.UpdateMappings(newSettings.ModelMappings)
+		} else if m.enabled {
+			log.Warnf("amp model mapper not initialized, skipping model mapping update")
+		}
+	}
+
+	if m.enabled {
+		// Check upstream URL change - now supports hot-reload
+		if newUpstreamURL == "" && oldUpstreamURL != "" {
+			m.setProxy(nil)
+			m.enabled = false
+		} else if oldUpstreamURL != "" && newUpstreamURL != oldUpstreamURL && newUpstreamURL != "" {
+			// Recreate proxy with new URL
+			proxy, err := createReverseProxy(newUpstreamURL, m.secretSource)
+			if err != nil {
+				log.Errorf("amp config: failed to create proxy for new upstream URL %s: %v", newUpstreamURL, err)
+			} else {
+				m.setProxy(proxy)
+			}
+		}
+
+		// Check API key change
+		apiKeyChanged := m.hasAPIKeyChanged(oldSettings, &newSettings)
+		if apiKeyChanged {
+			if m.secretSource != nil {
+				if ms, ok := m.secretSource.(*MultiSourceSecret); ok {
+					ms.UpdateExplicitKey(newSettings.UpstreamAPIKey)
+					ms.InvalidateCache()
+				}
+			}
+		}
+
+	}
+
+	// Store current config for next comparison
+	m.configMu.Lock()
+	settingsCopy := newSettings // copy struct
+	m.lastConfig = &settingsCopy
+	m.configMu.Unlock()
+
 	return nil
+}
+
+func (m *AmpModule) enableUpstreamProxy(upstreamURL string, settings *config.AmpCode) error {
+	if m.secretSource == nil {
+		m.secretSource = NewMultiSourceSecret(settings.UpstreamAPIKey, 0 /* default 5min */)
+	} else if ms, ok := m.secretSource.(*MultiSourceSecret); ok {
+		ms.UpdateExplicitKey(settings.UpstreamAPIKey)
+		ms.InvalidateCache()
+	}
+
+	proxy, err := createReverseProxy(upstreamURL, m.secretSource)
+	if err != nil {
+		return err
+	}
+
+	m.setProxy(proxy)
+	m.enabled = true
+
+	log.Infof("amp upstream proxy enabled for: %s", upstreamURL)
+	return nil
+}
+
+// hasModelMappingsChanged compares old and new model mappings.
+func (m *AmpModule) hasModelMappingsChanged(old *config.AmpCode, new *config.AmpCode) bool {
+	if old == nil {
+		return len(new.ModelMappings) > 0
+	}
+
+	if len(old.ModelMappings) != len(new.ModelMappings) {
+		return true
+	}
+
+	// Build map for efficient comparison
+	oldMap := make(map[string]string, len(old.ModelMappings))
+	for _, mapping := range old.ModelMappings {
+		oldMap[strings.TrimSpace(mapping.From)] = strings.TrimSpace(mapping.To)
+	}
+
+	for _, mapping := range new.ModelMappings {
+		from := strings.TrimSpace(mapping.From)
+		to := strings.TrimSpace(mapping.To)
+		if oldTo, exists := oldMap[from]; !exists || oldTo != to {
+			return true
+		}
+	}
+
+	return false
+}
+
+// hasAPIKeyChanged compares old and new API keys.
+func (m *AmpModule) hasAPIKeyChanged(old *config.AmpCode, new *config.AmpCode) bool {
+	oldKey := ""
+	if old != nil {
+		oldKey = strings.TrimSpace(old.UpstreamAPIKey)
+	}
+	newKey := strings.TrimSpace(new.UpstreamAPIKey)
+	return oldKey != newKey
+}
+
+// GetModelMapper returns the model mapper instance (for testing/debugging).
+func (m *AmpModule) GetModelMapper() *DefaultModelMapper {
+	return m.modelMapper
+}
+
+// getProxy returns the current proxy instance (thread-safe for hot-reload).
+func (m *AmpModule) getProxy() *httputil.ReverseProxy {
+	m.proxyMu.RLock()
+	defer m.proxyMu.RUnlock()
+	return m.proxy
+}
+
+// setProxy updates the proxy instance (thread-safe for hot-reload).
+func (m *AmpModule) setProxy(proxy *httputil.ReverseProxy) {
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	m.proxy = proxy
+}
+
+// IsRestrictedToLocalhost returns whether management routes are restricted to localhost.
+func (m *AmpModule) IsRestrictedToLocalhost() bool {
+	m.restrictMu.RLock()
+	defer m.restrictMu.RUnlock()
+	return m.restrictToLocalhost
+}
+
+// setRestrictToLocalhost updates the localhost restriction setting.
+func (m *AmpModule) setRestrictToLocalhost(restrict bool) {
+	m.restrictMu.Lock()
+	defer m.restrictMu.Unlock()
+	m.restrictToLocalhost = restrict
 }

@@ -891,6 +891,8 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	ctx := context.Background()
+	proxyHTTPClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{})
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, proxyHTTPClient)
 
 	// Optional project ID from query
 	projectID := c.Query("project_id")
@@ -976,7 +978,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		requestedProjectID := strings.TrimSpace(projectID)
 
 		// Create token storage (mirrors internal/auth/gemini createTokenStorage)
-		httpClient := conf.Client(ctx, token)
+		authHTTPClient := conf.Client(ctx, token)
 		req, errNewRequest := http.NewRequestWithContext(ctx, "GET", "https://www.googleapis.com/oauth2/v1/userinfo?alt=json", nil)
 		if errNewRequest != nil {
 			log.Errorf("Could not get user info: %v", errNewRequest)
@@ -986,7 +988,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token.AccessToken))
 
-		resp, errDo := httpClient.Do(req)
+		resp, errDo := authHTTPClient.Do(req)
 		if errDo != nil {
 			log.Errorf("Failed to execute request: %v", errDo)
 			oauthStatus[state] = "Failed to execute request"
@@ -1470,6 +1472,17 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 			}
 		}
 
+		projectID := ""
+		if strings.TrimSpace(tokenResp.AccessToken) != "" {
+			fetchedProjectID, errProject := sdkAuth.FetchAntigravityProjectID(ctx, tokenResp.AccessToken, httpClient)
+			if errProject != nil {
+				log.Warnf("antigravity: failed to fetch project ID: %v", errProject)
+			} else {
+				projectID = fetchedProjectID
+				log.Infof("antigravity: obtained project ID %s", projectID)
+			}
+		}
+
 		now := time.Now()
 		metadata := map[string]any{
 			"type":          "antigravity",
@@ -1481,6 +1494,9 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 		if email != "" {
 			metadata["email"] = email
+		}
+		if projectID != "" {
+			metadata["project_id"] = projectID
 		}
 
 		fileName := sanitizeAntigravityFileName(email)
@@ -1505,6 +1521,9 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 		delete(oauthStatus, state)
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		if projectID != "" {
+			fmt.Printf("Using GCP project: %s\n", projectID)
+		}
 		fmt.Println("You can now use Antigravity services through this CLI")
 	}()
 

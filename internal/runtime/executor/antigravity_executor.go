@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
@@ -365,29 +366,25 @@ func FetchAntigravityModels(ctx context.Context, auth *cliproxyauth.Auth, cfg *c
 		}
 
 		now := time.Now().Unix()
+		thinkingConfig := registry.GetAntigravityThinkingConfig()
 		models := make([]*registry.ModelInfo, 0, len(result.Map()))
-		for id := range result.Map() {
-			id = modelName2Alias(id)
-			if id != "" {
+		for originalName := range result.Map() {
+			aliasName := modelName2Alias(originalName)
+			if aliasName != "" {
 				modelInfo := &registry.ModelInfo{
-					ID:          id,
-					Name:        id,
-					Description: id,
-					DisplayName: id,
-					Version:     id,
+					ID:          aliasName,
+					Name:        aliasName,
+					Description: aliasName,
+					DisplayName: aliasName,
+					Version:     aliasName,
 					Object:      "model",
 					Created:     now,
 					OwnedBy:     antigravityAuthType,
 					Type:        antigravityAuthType,
 				}
-				// Add Thinking support for thinking models
-				if strings.HasSuffix(id, "-thinking") || strings.Contains(id, "-thinking-") {
-					modelInfo.Thinking = &registry.ThinkingSupport{
-						Min:            1024,
-						Max:            100000,
-						ZeroAllowed:    false,
-						DynamicAllowed: true,
-					}
+				// Look up Thinking support from static config using alias name
+				if thinking, ok := thinkingConfig[aliasName]; ok {
+					modelInfo.Thinking = thinking
 				}
 				models = append(models, modelInfo)
 			}
@@ -508,8 +505,46 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 		requestURL.WriteString(url.QueryEscape(alt))
 	}
 
-	payload = geminiToAntigravity(modelName, payload)
+	// Extract project_id from auth metadata if available
+	projectID := ""
+	if auth != nil && auth.Metadata != nil {
+		if pid, ok := auth.Metadata["project_id"].(string); ok {
+			projectID = strings.TrimSpace(pid)
+		}
+	}
+	payload = geminiToAntigravity(modelName, payload, projectID)
 	payload, _ = sjson.SetBytes(payload, "model", alias2ModelName(modelName))
+
+	if strings.Contains(modelName, "claude") {
+		strJSON := string(payload)
+		paths := make([]string, 0)
+		util.Walk(gjson.ParseBytes(payload), "", "parametersJsonSchema", &paths)
+		for _, p := range paths {
+			strJSON, _ = util.RenameKey(strJSON, p, p[:len(p)-len("parametersJsonSchema")]+"parameters")
+		}
+
+		strJSON = util.DeleteKey(strJSON, "$schema")
+		strJSON = util.DeleteKey(strJSON, "maxItems")
+		strJSON = util.DeleteKey(strJSON, "minItems")
+		strJSON = util.DeleteKey(strJSON, "minLength")
+		strJSON = util.DeleteKey(strJSON, "maxLength")
+		strJSON = util.DeleteKey(strJSON, "exclusiveMinimum")
+
+		paths = make([]string, 0)
+		util.Walk(gjson.Parse(strJSON), "", "anyOf", &paths)
+		for _, p := range paths {
+			anyOf := gjson.Get(strJSON, p)
+			if anyOf.IsArray() {
+				anyOfItems := anyOf.Array()
+				if len(anyOfItems) > 0 {
+					strJSON, _ = sjson.SetRaw(strJSON, p[:len(p)-len(".anyOf")], anyOfItems[0].Raw)
+				}
+			}
+		}
+
+		payload = []byte(strJSON)
+	}
+
 	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, requestURL.String(), bytes.NewReader(payload))
 	if errReq != nil {
 		return nil, errReq
@@ -646,7 +681,7 @@ func antigravityBaseURLFallbackOrder(auth *cliproxyauth.Auth) []string {
 	return []string{
 		antigravityBaseURLDaily,
 		antigravityBaseURLAutopush,
-		// antigravityBaseURLProd,
+		antigravityBaseURLProd,
 	}
 }
 
@@ -670,16 +705,22 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
-func geminiToAntigravity(modelName string, payload []byte) []byte {
+func geminiToAntigravity(modelName string, payload []byte, projectID string) []byte {
 	template, _ := sjson.Set(string(payload), "model", modelName)
 	template, _ = sjson.Set(template, "userAgent", "antigravity")
-	template, _ = sjson.Set(template, "project", generateProjectID())
+
+	// Use real project ID from auth if available, otherwise generate random (legacy fallback)
+	if projectID != "" {
+		template, _ = sjson.Set(template, "project", projectID)
+	} else {
+		template, _ = sjson.Set(template, "project", generateProjectID())
+	}
 	template, _ = sjson.Set(template, "requestId", generateRequestID())
 	template, _ = sjson.Set(template, "request.sessionId", generateSessionID())
 
 	template, _ = sjson.Delete(template, "request.safetySettings")
 	template, _ = sjson.Set(template, "request.toolConfig.functionCallingConfig.mode", "VALIDATED")
-	template, _ = sjson.Delete(template, "request.generationConfig.maxOutputTokens")
+
 	if !strings.HasPrefix(modelName, "gemini-3-") {
 		if thinkingLevel := gjson.Get(template, "request.generationConfig.thinkingConfig.thinkingLevel"); thinkingLevel.Exists() {
 			template, _ = sjson.Delete(template, "request.generationConfig.thinkingConfig.thinkingLevel")
@@ -687,7 +728,7 @@ func geminiToAntigravity(modelName string, payload []byte) []byte {
 		}
 	}
 
-	if strings.HasPrefix(modelName, "claude-sonnet-") {
+	if strings.Contains(modelName, "claude") {
 		gjson.Get(template, "request.tools").ForEach(func(key, tool gjson.Result) bool {
 			tool.Get("functionDeclarations").ForEach(func(funKey, funcDecl gjson.Result) bool {
 				if funcDecl.Get("parametersJsonSchema").Exists() {
@@ -699,6 +740,8 @@ func geminiToAntigravity(modelName string, payload []byte) []byte {
 			})
 			return true
 		})
+	} else {
+		template, _ = sjson.Delete(template, "request.generationConfig.maxOutputTokens")
 	}
 
 	return []byte(template)
@@ -734,6 +777,8 @@ func modelName2Alias(modelName string) string {
 		return "gemini-claude-sonnet-4-5"
 	case "claude-sonnet-4-5-thinking":
 		return "gemini-claude-sonnet-4-5-thinking"
+	case "claude-opus-4-5-thinking":
+		return "gemini-claude-opus-4-5-thinking"
 	case "chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-3-pro-low", "gemini-2.5-pro":
 		return ""
 	default:
@@ -753,6 +798,8 @@ func alias2ModelName(modelName string) string {
 		return "claude-sonnet-4-5"
 	case "gemini-claude-sonnet-4-5-thinking":
 		return "claude-sonnet-4-5-thinking"
+	case "gemini-claude-opus-4-5-thinking":
+		return "claude-opus-4-5-thinking"
 	default:
 		return modelName
 	}
