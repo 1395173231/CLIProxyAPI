@@ -7,7 +7,6 @@
 package claude
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -15,7 +14,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -186,14 +184,6 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
 //   - c: The Gin context for the request.
 //   - rawJSON: The raw JSON request body.
 func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte) {
-	// Set up Server-Sent Events (SSE) headers for streaming response
-	// These headers are essential for maintaining a persistent connection
-	// and enabling real-time streaming of chat completions
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("Access-Control-Allow-Origin", "*")
-
 	// Get the http.Flusher interface to manually flush the response.
 	// This is crucial for streaming as it allows immediate sending of data chunks
 	flusher, ok := c.Writer.(http.Flusher)
@@ -214,79 +204,80 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 
 	dataChan, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
-	h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
-	return
-}
+	setSSEHeaders := func() {
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("Access-Control-Allow-Origin", "*")
+	}
 
-func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	// v6.1: Intelligent Buffered Streamer strategy
-	// Enhanced buffering with larger buffer size (16KB) and longer flush interval (120ms).
-	// Smart flush only when buffer is sufficiently filled (≥50%), dramatically reducing
-	// flush frequency from ~12.5Hz to ~5-8Hz while maintaining low latency.
-	writer := bufio.NewWriterSize(c.Writer, 16*1024) // 4KB → 16KB
-	ticker := time.NewTicker(120 * time.Millisecond) // 80ms → 120ms
-	defer ticker.Stop()
-
-	var chunkIdx int
-
+	// Peek at the first chunk to determine success or failure before setting headers
 	for {
 		select {
 		case <-c.Request.Context().Done():
-			// Context cancelled, flush any remaining data before exit
-			_ = writer.Flush()
-			cancel(c.Request.Context().Err())
+			cliCancel(c.Request.Context().Err())
 			return
-
-		case <-ticker.C:
-			// Smart flush: only flush when buffer has sufficient data (≥50% full)
-			// This reduces flush frequency while ensuring data flows naturally
-			buffered := writer.Buffered()
-			if buffered >= 8*1024 { // At least 8KB (50% of 16KB buffer)
-				if err := writer.Flush(); err != nil {
-					// Error flushing, cancel and return
-					cancel(err)
-					return
-				}
-				flusher.Flush() // Also flush the underlying http.ResponseWriter
-			}
-
-		case chunk, ok := <-data:
+		case errMsg, ok := <-errChan:
 			if !ok {
-				// Stream ended, flush remaining data
-				_ = writer.Flush()
-				cancel(nil)
+				// Err channel closed cleanly; wait for data channel.
+				errChan = nil
+				continue
+			}
+			// Upstream failed immediately. Return proper error status and JSON.
+			h.WriteErrorResponse(c, errMsg)
+			if errMsg != nil {
+				cliCancel(errMsg.Error)
+			} else {
+				cliCancel(nil)
+			}
+			return
+		case chunk, ok := <-dataChan:
+			if !ok {
+				// Stream closed without data? Send DONE or just headers.
+				setSSEHeaders()
+				flusher.Flush()
+				cliCancel(nil)
 				return
 			}
 
-			// Forward the complete SSE event block directly (already formatted by the translator).
-			// The translator returns a complete SSE-compliant event block, including event:, data:, and separators.
-			// The handler just needs to forward it without reassembly.
-			if len(chunk) > 0 {
-				_, _ = writer.Write(chunk)
-			}
-			chunkIdx++
+			// Success! Set headers now.
+			setSSEHeaders()
 
-		case errMsg, ok := <-errs:
-			if !ok {
-				continue
+			// Write the first chunk
+			if len(chunk) > 0 {
+				_, _ = c.Writer.Write(chunk)
+				flusher.Flush()
 			}
-			if errMsg != nil {
-				// An error occurred: emit as a proper SSE error event
-				errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
-				_, _ = writer.WriteString("event: error\n")
-				_, _ = writer.WriteString("data: ")
-				_, _ = writer.Write(errorBytes)
-				_, _ = writer.WriteString("\n\n")
-				_ = writer.Flush()
-			}
-			var execErr error
-			if errMsg != nil {
-				execErr = errMsg.Error
-			}
-			cancel(execErr)
+
+			// Continue streaming the rest
+			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 			return
 		}
 	}
+}
+
+func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
+	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+		WriteChunk: func(chunk []byte) {
+			if len(chunk) == 0 {
+				return
+			}
+			_, _ = c.Writer.Write(chunk)
+		},
+		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+			if errMsg == nil {
+				return
+			}
+			status := http.StatusInternalServerError
+			if errMsg.StatusCode > 0 {
+				status = errMsg.StatusCode
+			}
+			c.Status(status)
+
+			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+		},
+	})
 }
 
 type claudeErrorDetail struct {

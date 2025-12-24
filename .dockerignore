@@ -27,7 +27,11 @@ config.yaml
 bin/*
 .claude/*
 .vscode/*
+.gemini/*
 .serena/*
 docs
 .docker-cache
 gitstore
+.agent/*
+.bmad/*
+_bmad/*

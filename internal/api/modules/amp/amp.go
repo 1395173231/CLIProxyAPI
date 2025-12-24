@@ -137,7 +137,8 @@ func (m *AmpModule) Register(ctx modules.Context) error {
 		m.registerProviderAliases(ctx.Engine, ctx.BaseHandler, auth)
 
 		// Register management proxy routes once; middleware will gate access when upstream is unavailable.
-		m.registerManagementRoutes(ctx.Engine, ctx.BaseHandler)
+		// Pass auth middleware to require valid API key for all management routes.
+		m.registerManagementRoutes(ctx.Engine, ctx.BaseHandler, auth)
 
 		// If no upstream URL, skip proxy routes but provider aliases are still available
 		if upstreamURL == "" {
@@ -187,9 +188,6 @@ func (m *AmpModule) OnConfigUpdated(cfg *config.Config) error {
 
 	if oldSettings != nil && oldSettings.RestrictManagementToLocalhost != newSettings.RestrictManagementToLocalhost {
 		m.setRestrictToLocalhost(newSettings.RestrictManagementToLocalhost)
-		if !newSettings.RestrictManagementToLocalhost {
-			log.Warnf("amp management routes now accessible from any IP - this is insecure!")
-		}
 	}
 
 	newUpstreamURL := strings.TrimSpace(newSettings.UpstreamURL)
@@ -281,16 +279,23 @@ func (m *AmpModule) hasModelMappingsChanged(old *config.AmpCode, new *config.Amp
 		return true
 	}
 
-	// Build map for efficient comparison
-	oldMap := make(map[string]string, len(old.ModelMappings))
+	// Build map for efficient and robust comparison
+	type mappingInfo struct {
+		to    string
+		regex bool
+	}
+	oldMap := make(map[string]mappingInfo, len(old.ModelMappings))
 	for _, mapping := range old.ModelMappings {
-		oldMap[strings.TrimSpace(mapping.From)] = strings.TrimSpace(mapping.To)
+		oldMap[strings.TrimSpace(mapping.From)] = mappingInfo{
+			to:    strings.TrimSpace(mapping.To),
+			regex: mapping.Regex,
+		}
 	}
 
 	for _, mapping := range new.ModelMappings {
 		from := strings.TrimSpace(mapping.From)
 		to := strings.TrimSpace(mapping.To)
-		if oldTo, exists := oldMap[from]; !exists || oldTo != to {
+		if oldVal, exists := oldMap[from]; !exists || oldVal.to != to || oldVal.regex != mapping.Regex {
 			return true
 		}
 	}

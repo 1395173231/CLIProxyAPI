@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -134,6 +135,18 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		auths:           make(map[string]*Auth),
 		providerOffsets: make(map[string]int),
 	}
+}
+
+func (m *Manager) SetSelector(selector Selector) {
+	if m == nil {
+		return
+	}
+	if selector == nil {
+		selector = &RoundRobinSelector{}
+	}
+	m.mu.Lock()
+	m.selector = selector
+	m.mu.Unlock()
 }
 
 // SetStore swaps the underlying persistence store.
@@ -368,6 +381,7 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 	if provider == "" {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "provider identifier is empty"}
 	}
+	routeModel := req.Model
 	tried := make(map[string]struct{})
 	var lastErr error
 	attemptedSanitized := false
@@ -380,7 +394,7 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 	}
 
 	for {
-		auth, executor, errPick := m.pickNext(ctx, provider, req.Model, opts, tried)
+		auth, executor, errPick := m.pickNext(ctx, provider, routeModel, opts, tried)
 		if errPick != nil {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -389,10 +403,20 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 		}
 
 		accountType, accountInfo := auth.AccountInfo()
+		proxyInfo := auth.ProxyInfo()
+		entry := logEntryWithRequestID(ctx)
 		if accountType == "api_key" {
-			log.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
+			if proxyInfo != "" {
+				entry.Debugf("Use API key %s for model %s %s", util.HideAPIKey(accountInfo), req.Model, proxyInfo)
+			} else {
+				entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
+			}
 		} else if accountType == "oauth" {
-			log.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
+			if proxyInfo != "" {
+				entry.Debugf("Use OAuth %s for model %s %s", accountInfo, req.Model, proxyInfo)
+			} else {
+				entry.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
+			}
 		}
 
 		tried[auth.ID] = struct{}{}
@@ -401,8 +425,10 @@ func (m *Manager) executeWithProvider(ctx context.Context, provider string, req 
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		resp, errExec := executor.Execute(execCtx, auth, req, opts)
-		result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: errExec == nil}
+		execReq := req
+		execReq.Model, execReq.Metadata = rewriteModelForAuth(routeModel, req.Metadata, auth)
+		resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
 			// If upstream returned 400 with undownloadable URL, record and retry once with sanitized payload.
 			var se cliproxyexecutor.StatusError
@@ -488,6 +514,7 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 	if provider == "" {
 		return cliproxyexecutor.Response{}, &Error{Code: "provider_not_found", Message: "provider identifier is empty"}
 	}
+	routeModel := req.Model
 	tried := make(map[string]struct{})
 	var lastErr error
 	attemptedSanitized := false
@@ -501,7 +528,7 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 	}
 
 	for {
-		auth, executor, errPick := m.pickNext(ctx, provider, req.Model, opts, tried)
+		auth, executor, errPick := m.pickNext(ctx, provider, routeModel, opts, tried)
 		if errPick != nil {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -510,10 +537,20 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 		}
 
 		accountType, accountInfo := auth.AccountInfo()
+		proxyInfo := auth.ProxyInfo()
+		entry := logEntryWithRequestID(ctx)
 		if accountType == "api_key" {
-			log.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
+			if proxyInfo != "" {
+				entry.Debugf("Use API key %s for model %s %s", util.HideAPIKey(accountInfo), req.Model, proxyInfo)
+			} else {
+				entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
+			}
 		} else if accountType == "oauth" {
-			log.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
+			if proxyInfo != "" {
+				entry.Debugf("Use OAuth %s for model %s %s", accountInfo, req.Model, proxyInfo)
+			} else {
+				entry.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
+			}
 		}
 
 		tried[auth.ID] = struct{}{}
@@ -522,8 +559,10 @@ func (m *Manager) executeCountWithProvider(ctx context.Context, provider string,
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		resp, errExec := executor.CountTokens(execCtx, auth, req, opts)
-		result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: errExec == nil}
+		execReq := req
+		execReq.Model, execReq.Metadata = rewriteModelForAuth(routeModel, req.Metadata, auth)
+		resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+		result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
 		if errExec != nil {
 			// Handle 400 undownloadable URL similarly to executeWithProvider
 			var se cliproxyexecutor.StatusError
@@ -606,6 +645,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 	if provider == "" {
 		return nil, &Error{Code: "provider_not_found", Message: "provider identifier is empty"}
 	}
+	routeModel := req.Model
 	tried := make(map[string]struct{})
 	var lastErr error
 	attemptedSanitized := false
@@ -619,7 +659,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 	}
 
 	for {
-		auth, executor, errPick := m.pickNext(ctx, provider, req.Model, opts, tried)
+		auth, executor, errPick := m.pickNext(ctx, provider, routeModel, opts, tried)
 		if errPick != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -628,10 +668,20 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 		}
 
 		accountType, accountInfo := auth.AccountInfo()
+		proxyInfo := auth.ProxyInfo()
+		entry := logEntryWithRequestID(ctx)
 		if accountType == "api_key" {
-			log.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
+			if proxyInfo != "" {
+				entry.Debugf("Use API key %s for model %s %s", util.HideAPIKey(accountInfo), req.Model, proxyInfo)
+			} else {
+				entry.Debugf("Use API key %s for model %s", util.HideAPIKey(accountInfo), req.Model)
+			}
 		} else if accountType == "oauth" {
-			log.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
+			if proxyInfo != "" {
+				entry.Debugf("Use OAuth %s for model %s %s", accountInfo, req.Model, proxyInfo)
+			} else {
+				entry.Debugf("Use OAuth %s for model %s", accountInfo, req.Model)
+			}
 		}
 
 		tried[auth.ID] = struct{}{}
@@ -640,7 +690,9 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
 			execCtx = context.WithValue(execCtx, "cliproxy.roundtripper", rt)
 		}
-		chunks, errStream := executor.ExecuteStream(execCtx, auth, req, opts)
+		execReq := req
+		execReq.Model, execReq.Metadata = rewriteModelForAuth(routeModel, req.Metadata, auth)
+		chunks, errStream := executor.ExecuteStream(execCtx, auth, execReq, opts)
 		if errStream != nil {
 			// If the initial streaming request fails with 400 undownloadable URL, record and retry once sanitized.
 			var se cliproxyexecutor.StatusError
@@ -701,7 +753,7 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 			if status > 0 {
 				rerr.HTTPStatus = status
 			}
-			result := Result{AuthID: auth.ID, Provider: provider, Model: req.Model, Success: false, Error: rerr}
+			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: false, Error: rerr}
 			result.RetryAfter = retryAfterFromError(errStream)
 			m.MarkResult(execCtx, result)
 			lastErr = errStream
@@ -724,17 +776,65 @@ func (m *Manager) executeStreamWithProvider(ctx context.Context, provider string
 					if errors.As(chunk.Err, &se) && se != nil {
 						rerr.HTTPStatus = se.StatusCode()
 					}
-					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: req.Model, Success: false, Error: rerr})
+					m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: false, Error: rerr})
 				}
 				out <- chunk
 			}
 			if !failed {
-				m.recordStickyOnSuccess(streamProvider, req.Model, opts, streamAuth.ID)
-				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: req.Model, Success: true})
+				m.recordStickyOnSuccess(streamProvider, routeModel, opts, streamAuth.ID)
+				m.MarkResult(streamCtx, Result{AuthID: streamAuth.ID, Provider: streamProvider, Model: routeModel, Success: true})
 			}
 		}(execCtx, auth.Clone(), provider, chunks)
 		return out, nil
 	}
+}
+
+func rewriteModelForAuth(model string, metadata map[string]any, auth *Auth) (string, map[string]any) {
+	if auth == nil || model == "" {
+		return model, metadata
+	}
+	prefix := strings.TrimSpace(auth.Prefix)
+	if prefix == "" {
+		return model, metadata
+	}
+	needle := prefix + "/"
+	if !strings.HasPrefix(model, needle) {
+		return model, metadata
+	}
+	rewritten := strings.TrimPrefix(model, needle)
+	return rewritten, stripPrefixFromMetadata(metadata, needle)
+}
+
+func stripPrefixFromMetadata(metadata map[string]any, needle string) map[string]any {
+	if len(metadata) == 0 || needle == "" {
+		return metadata
+	}
+	keys := []string{
+		util.ThinkingOriginalModelMetadataKey,
+		util.GeminiOriginalModelMetadataKey,
+	}
+	var out map[string]any
+	for _, key := range keys {
+		raw, ok := metadata[key]
+		if !ok {
+			continue
+		}
+		value, okStr := raw.(string)
+		if !okStr || !strings.HasPrefix(value, needle) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]any, len(metadata))
+			for k, v := range metadata {
+				out[k] = v
+			}
+		}
+		out[key] = strings.TrimPrefix(value, needle)
+	}
+	if out == nil {
+		return metadata
+	}
+	return out
 }
 
 func (m *Manager) normalizeProviders(providers []string) []string {
@@ -1933,6 +2033,17 @@ type RoundTripperProvider interface {
 // to mutate outbound HTTP requests with provider credentials.
 type RequestPreparer interface {
 	PrepareRequest(req *http.Request, auth *Auth) error
+}
+
+// logEntryWithRequestID returns a logrus entry with request_id field if available in context.
+func logEntryWithRequestID(ctx context.Context) *log.Entry {
+	if ctx == nil {
+		return log.NewEntry(log.StandardLogger())
+	}
+	if reqID := logging.GetRequestID(ctx); reqID != "" {
+		return log.WithField("request_id", reqID)
+	}
+	return log.NewEntry(log.StandardLogger())
 }
 
 // InjectCredentials delegates per-provider HTTP request preparation when supported.

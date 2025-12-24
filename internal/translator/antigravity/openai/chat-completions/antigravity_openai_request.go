@@ -40,41 +40,38 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	re := gjson.GetBytes(rawJSON, "reasoning_effort")
 	hasOfficialThinking := re.Exists()
 	if hasOfficialThinking && util.ModelSupportsThinking(modelName) {
-		switch re.String() {
-		case "none":
-			out, _ = sjson.DeleteBytes(out, "request.generationConfig.thinkingConfig.include_thoughts")
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", 0)
-		case "auto":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "low":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 1024))
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "medium":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 8192))
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "high":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 32768))
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		default:
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
+		effort := strings.ToLower(strings.TrimSpace(re.String()))
+		if util.IsGemini3Model(modelName) {
+			switch effort {
+			case "none":
+				out, _ = sjson.DeleteBytes(out, "request.generationConfig.thinkingConfig")
+			case "auto":
+				includeThoughts := true
+				out = util.ApplyGeminiCLIThinkingLevel(out, "", &includeThoughts)
+			default:
+				if level, ok := util.ValidateGemini3ThinkingLevel(modelName, effort); ok {
+					out = util.ApplyGeminiCLIThinkingLevel(out, level, nil)
+				}
+			}
+		} else if !util.ModelUsesThinkingLevels(modelName) {
+			out = util.ApplyReasoningEffortToGeminiCLI(out, effort)
 		}
 	}
 
 	// Cherry Studio extension extra_body.google.thinking_config (effective only when official fields are absent)
-	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) {
+	// Only apply for models that use numeric budgets, not discrete levels.
+	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
 		if tc := gjson.GetBytes(rawJSON, "extra_body.google.thinking_config"); tc.Exists() && tc.IsObject() {
 			var setBudget bool
-			var normalized int
+			var budget int
 
 			if v := tc.Get("thinkingBudget"); v.Exists() {
-				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
-				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", normalized)
+				budget = int(v.Int())
+				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
 				setBudget = true
 			} else if v := tc.Get("thinking_budget"); v.Exists() {
-				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
-				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", normalized)
+				budget = int(v.Int())
+				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
 				setBudget = true
 			}
 
@@ -82,7 +79,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", v.Bool())
 			} else if v := tc.Get("include_thoughts"); v.Exists() {
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", v.Bool())
-			} else if setBudget && normalized != 0 {
+			} else if setBudget && budget != 0 {
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
 			}
 		}
@@ -94,7 +91,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		if t := gjson.GetBytes(rawJSON, "thinking"); t.Exists() && t.IsObject() {
 			if t.Get("type").String() == "enabled" {
 				if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
-					budget := util.NormalizeThinkingBudget(modelName, int(b.Int()))
+					budget := int(b.Int())
 					out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
 					out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
 				}
@@ -102,16 +99,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		}
 	}
 
-	// For gemini-3-pro-preview, always send default thinkingConfig when none specified.
-	// This matches the official Gemini CLI behavior which always sends:
-	// { thinkingBudget: -1, includeThoughts: true }
-	// See: ai-gemini-cli/packages/core/src/config/defaultModelConfigs.ts
-	if !gjson.GetBytes(out, "request.generationConfig.thinkingConfig").Exists() && modelName == "gemini-3-pro-preview" {
-		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-	}
-
-	// Temperature/top_p/top_k
+	// Temperature/top_p/top_k/max_tokens
 	if tr := gjson.GetBytes(rawJSON, "temperature"); tr.Exists() && tr.Type == gjson.Number {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.temperature", tr.Num)
 	}
@@ -120,6 +108,9 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	}
 	if tkr := gjson.GetBytes(rawJSON, "top_k"); tkr.Exists() && tkr.Type == gjson.Number {
 		out, _ = sjson.SetBytes(out, "request.generationConfig.topK", tkr.Num)
+	}
+	if maxTok := gjson.GetBytes(rawJSON, "max_tokens"); maxTok.Exists() && maxTok.Type == gjson.Number {
+		out, _ = sjson.SetBytes(out, "request.generationConfig.maxOutputTokens", maxTok.Num)
 	}
 
 	// Map OpenAI modalities -> Gemini CLI request.generationConfig.responseModalities
@@ -201,6 +192,14 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				} else if content.IsObject() && content.Get("type").String() == "text" {
 					out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
 					out, _ = sjson.SetBytes(out, "request.systemInstruction.parts.0.text", content.Get("text").String())
+				} else if content.IsArray() {
+					contents := content.Array()
+					if len(contents) > 0 {
+						out, _ = sjson.SetBytes(out, "request.systemInstruction.role", "user")
+						for j := 0; j < len(contents); j++ {
+							out, _ = sjson.SetBytes(out, fmt.Sprintf("request.systemInstruction.parts.%d.text", j), contents[j].Get("text").String())
+						}
+					}
 				}
 			} else if role == "user" || (role == "system" && len(arr) == 1) {
 				// Build single user content node to avoid splitting into multiple contents
@@ -246,62 +245,65 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				}
 				out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
 			} else if role == "assistant" {
+				node := []byte(`{"role":"model","parts":[]}`)
+				p := 0
 				if content.Type == gjson.String {
-					// Assistant text -> single model content
-					node := []byte(`{"role":"model","parts":[{"text":""}]}`)
-					node, _ = sjson.SetBytes(node, "parts.0.text", content.String())
+					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
 					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
-				} else if !content.Exists() || content.Type == gjson.Null {
-					// Tool calls -> single model content with functionCall parts
-					tcs := m.Get("tool_calls")
-					if tcs.IsArray() {
-						node := []byte(`{"role":"model","parts":[]}`)
-						p := 0
-						fIDs := make([]string, 0)
-						for _, tc := range tcs.Array() {
-							if tc.Get("type").String() != "function" {
-								continue
-							}
-							fid := tc.Get("id").String()
-							fname := tc.Get("function.name").String()
-							fargs := tc.Get("function.arguments").String()
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
-							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
-							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
-							p++
-							if fid != "" {
-								fIDs = append(fIDs, fid)
-							}
-						}
-						out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+					p++
+				}
 
-						// Append a single tool content combining name + response per function
-						toolNode := []byte(`{"role":"user","parts":[]}`)
-						pp := 0
-						for _, fid := range fIDs {
-							if name, ok := tcID2Name[fid]; ok {
-								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
-								toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", name)
-								resp := toolResponses[fid]
-								if resp == "" {
-									resp = "{}"
-								}
-								// Handle non-JSON output gracefully (matches dev branch approach)
-								if resp != "null" {
-									parsed := gjson.Parse(resp)
-									if parsed.Type == gjson.JSON {
-										toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
-									} else {
-										toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
-									}
-								}
-								pp++
+				// Tool calls -> single model content with functionCall parts
+				tcs := m.Get("tool_calls")
+				if tcs.IsArray() {
+					fIDs := make([]string, 0)
+					for _, tc := range tcs.Array() {
+						if tc.Get("type").String() != "function" {
+							continue
+						}
+						fid := tc.Get("id").String()
+						fname := tc.Get("function.name").String()
+						fargs := tc.Get("function.arguments").String()
+						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.id", fid)
+						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
+						if gjson.Valid(fargs) {
+							node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
+						} else {
+							node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.args.params", []byte(fargs))
+						}
+						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiCLIFunctionThoughtSignature)
+						p++
+						if fid != "" {
+							fIDs = append(fIDs, fid)
+						}
+					}
+					out, _ = sjson.SetRawBytes(out, "request.contents.-1", node)
+
+					// Append a single tool content combining name + response per function
+					toolNode := []byte(`{"role":"user","parts":[]}`)
+					pp := 0
+					for _, fid := range fIDs {
+						if name, ok := tcID2Name[fid]; ok {
+							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.id", fid)
+							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", name)
+							resp := toolResponses[fid]
+							if resp == "" {
+								resp = "{}"
 							}
+							// Handle non-JSON output gracefully (matches dev branch approach)
+							if resp != "null" {
+								parsed := gjson.Parse(resp)
+								if parsed.Type == gjson.JSON {
+									toolNode, _ = sjson.SetRawBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(parsed.Raw))
+								} else {
+									toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", resp)
+								}
+							}
+							pp++
 						}
-						if pp > 0 {
-							out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
-						}
+					}
+					if pp > 0 {
+						out, _ = sjson.SetRawBytes(out, "request.contents.-1", toolNode)
 					}
 				}
 			}
@@ -329,7 +331,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 								log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
 								continue
 							}
-							fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.properties", map[string]interface{}{})
+							fnRaw, errSet = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
 							if errSet != nil {
 								log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
 								continue
@@ -344,7 +346,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 							log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
 							continue
 						}
-						fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.properties", map[string]interface{}{})
+						fnRaw, errSet = sjson.SetRaw(fnRaw, "parametersJsonSchema.properties", `{}`)
 						if errSet != nil {
 							log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
 							continue
@@ -385,18 +387,3 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 
 // itoa converts int to string without strconv import for few usages.
 func itoa(i int) string { return fmt.Sprintf("%d", i) }
-
-// quoteIfNeeded ensures a string is valid JSON value (quotes plain text), pass-through for JSON objects/arrays.
-func quoteIfNeeded(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return "\"\""
-	}
-	if len(s) > 0 && (s[0] == '{' || s[0] == '[') {
-		return s
-	}
-	// escape quotes minimally
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	return "\"" + s + "\""
-}

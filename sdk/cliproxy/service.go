@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -23,6 +22,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -498,7 +498,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}()
 
 	time.Sleep(100 * time.Millisecond)
-	fmt.Printf("API server started successfully on: %d\n", s.cfg.Port)
+	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
 
 	if s.hooks.OnAfterStart != nil {
 		s.hooks.OnAfterStart(s)
@@ -506,6 +506,13 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
+		previousStrategy := ""
+		s.cfgMu.RLock()
+		if s.cfg != nil {
+			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+		}
+		s.cfgMu.RUnlock()
+
 		if newCfg == nil {
 			s.cfgMu.RLock()
 			newCfg = s.cfg
@@ -514,6 +521,30 @@ func (s *Service) Run(ctx context.Context) error {
 		if newCfg == nil {
 			return
 		}
+
+		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
+		normalizeStrategy := func(strategy string) string {
+			switch strategy {
+			case "fill-first", "fillfirst", "ff":
+				return "fill-first"
+			default:
+				return "round-robin"
+			}
+		}
+		previousStrategy = normalizeStrategy(previousStrategy)
+		nextStrategy = normalizeStrategy(nextStrategy)
+		if s.coreManager != nil && previousStrategy != nextStrategy {
+			var selector coreauth.Selector
+			switch nextStrategy {
+			case "fill-first":
+				selector = &coreauth.FillFirstSelector{}
+			default:
+				selector = &coreauth.RoundRobinSelector{}
+			}
+			s.coreManager.SetSelector(selector)
+			log.Infof("routing strategy updated to %s", nextStrategy)
+		}
+
 		s.applyRetryConfig(newCfg)
 		if s.server != nil {
 			s.server.UpdateClients(newCfg)
@@ -779,7 +810,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 							Created:     time.Now().Unix(),
 							OwnedBy:     compat.Name,
 							Type:        "openai-compatibility",
-							DisplayName: m.Name,
+							DisplayName: modelID,
 						})
 					}
 					// Register and return
@@ -787,7 +818,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
-						GlobalModelRegistry().RegisterClient(a.ID, providerKey, ms)
+						GlobalModelRegistry().RegisterClient(a.ID, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -807,7 +838,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		GlobalModelRegistry().RegisterClient(a.ID, key, models)
+		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return
 	}
 
@@ -985,6 +1016,48 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 		}
 	}
 	return filtered
+}
+
+func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
+	trimmedPrefix := strings.TrimSpace(prefix)
+	if trimmedPrefix == "" || len(models) == 0 {
+		return models
+	}
+
+	out := make([]*ModelInfo, 0, len(models)*2)
+	seen := make(map[string]struct{}, len(models)*2)
+
+	addModel := func(model *ModelInfo) {
+		if model == nil {
+			return
+		}
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, model)
+	}
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		baseID := strings.TrimSpace(model.ID)
+		if baseID == "" {
+			continue
+		}
+		if !forceModelPrefix || trimmedPrefix == baseID {
+			addModel(model)
+		}
+		clone := *model
+		clone.ID = trimmedPrefix + "/" + baseID
+		addModel(&clone)
+	}
+	return out
 }
 
 // matchWildcard performs case-insensitive wildcard matching where '*' matches any substring.

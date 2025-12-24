@@ -9,12 +9,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
- 
+
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
 // Builder constructs a Service instance with customizable providers.
@@ -222,53 +222,64 @@ func (b *Builder) Build() (*Service, error) {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
-		// Choose sticky selector: Redis-backed when enabled, otherwise in-memory
-		var selector coreauth.Selector
+
+		strategy := ""
 		if b.cfg != nil {
-			sti := b.cfg.SDKConfig.StickyIndex
-			// Environment overrides (take precedence over YAML)
-			if v, ok := envLookup("STICKY_INDEX_REDIS_ENABLED", "sticky_index_redis_enabled"); ok {
-				sti.RedisEnabled = parseBoolEnv(v)
-			}
-			if v, ok := envLookup("STICKY_INDEX_REDIS_ADDR", "sticky_index_redis_addr"); ok {
-				sti.RedisAddr = v
-			}
-			if v, ok := envLookup("STICKY_INDEX_REDIS_PASSWORD", "sticky_index_redis_password"); ok {
-				sti.RedisPassword = v
-			}
-			if v, ok := envLookup("STICKY_INDEX_REDIS_DB", "sticky_index_redis_db"); ok {
-				if n, err := strconv.Atoi(v); err == nil {
-					sti.RedisDB = n
-				}
-			}
-			if v, ok := envLookup("STICKY_INDEX_REDIS_PREFIX", "sticky_index_redis_prefix"); ok {
-				sti.RedisPrefix = v
-			}
-			if v, ok := envLookup("STICKY_INDEX_TTL_SECONDS", "sticky_index_ttl_seconds"); ok {
-				if n, err := strconv.Atoi(v); err == nil {
-					sti.TTLSeconds = n
-				}
-			}
-	
-			if sti.RedisEnabled {
-				var ttl time.Duration
-				if sti.TTLSeconds > 0 {
-					ttl = time.Duration(sti.TTLSeconds) * time.Second
-				}
-				selector = coreauth.NewSmartStickySelectorWithRedis(coreauth.RedisOptions{
-					Addr:     sti.RedisAddr,
-					Password: sti.RedisPassword,
-					DB:       sti.RedisDB,
-					Prefix:   sti.RedisPrefix,
-					TTL:      ttl,
-				})
+			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
+		}
+		var selector coreauth.Selector
+		switch strategy {
+		case "fill-first", "fillfirst", "ff":
+			selector = &coreauth.FillFirstSelector{}
+		default:
+			selector = &coreauth.RoundRobinSelector{}
+		}
+	// Choose sticky selector: Redis-backed when enabled, otherwise in-memory
+	if b.cfg != nil {
+		sti := b.cfg.SDKConfig.StickyIndex
+		// Environment overrides (take precedence over YAML)
+		if v, ok := envLookup("STICKY_INDEX_REDIS_ENABLED", "sticky_index_redis_enabled"); ok {
+			sti.RedisEnabled = parseBoolEnv(v)
+		}
+		if v, ok := envLookup("STICKY_INDEX_REDIS_ADDR", "sticky_index_redis_addr"); ok {
+			sti.RedisAddr = v
+		}
+		if v, ok := envLookup("STICKY_INDEX_REDIS_PASSWORD", "sticky_index_redis_password"); ok {
+			sti.RedisPassword = v
+		}
+		if v, ok := envLookup("STICKY_INDEX_REDIS_DB", "sticky_index_redis_db"); ok {
+			if n, err := strconv.Atoi(v); err == nil {
+				sti.RedisDB = n
 			}
 		}
-		if selector == nil {
-			selector = coreauth.NewSmartStickySelector()
+		if v, ok := envLookup("STICKY_INDEX_REDIS_PREFIX", "sticky_index_redis_prefix"); ok {
+			sti.RedisPrefix = v
 		}
-		coreManager = coreauth.NewManager(tokenStore, selector, nil)
+		if v, ok := envLookup("STICKY_INDEX_TTL_SECONDS", "sticky_index_ttl_seconds"); ok {
+			if n, err := strconv.Atoi(v); err == nil {
+				sti.TTLSeconds = n
+			}
+		}
+
+		if sti.RedisEnabled {
+			var ttl time.Duration
+			if sti.TTLSeconds > 0 {
+				ttl = time.Duration(sti.TTLSeconds) * time.Second
+			}
+			selector = coreauth.NewSmartStickySelectorWithRedis(coreauth.RedisOptions{
+				Addr:     sti.RedisAddr,
+				Password: sti.RedisPassword,
+				DB:       sti.RedisDB,
+				Prefix:   sti.RedisPrefix,
+				TTL:      ttl,
+			})
+		}
 	}
+	if selector == nil {
+		selector = coreauth.NewSmartStickySelector()
+	}
+	coreManager = coreauth.NewManager(tokenStore, selector, nil)
+}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
 

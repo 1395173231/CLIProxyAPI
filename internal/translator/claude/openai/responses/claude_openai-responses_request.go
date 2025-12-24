@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -52,20 +53,23 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 	root := gjson.ParseBytes(rawJSON)
 
-	if v := root.Get("reasoning.effort"); v.Exists() {
-		out, _ = sjson.Set(out, "thinking.type", "enabled")
-
-		switch v.String() {
-		case "none":
-			out, _ = sjson.Set(out, "thinking.type", "disabled")
-		case "minimal":
-			out, _ = sjson.Set(out, "thinking.budget_tokens", 1024)
-		case "low":
-			out, _ = sjson.Set(out, "thinking.budget_tokens", 4096)
-		case "medium":
-			out, _ = sjson.Set(out, "thinking.budget_tokens", 8192)
-		case "high":
-			out, _ = sjson.Set(out, "thinking.budget_tokens", 24576)
+	if v := root.Get("reasoning.effort"); v.Exists() && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
+		effort := strings.ToLower(strings.TrimSpace(v.String()))
+		if effort != "" {
+			budget, ok := util.ThinkingEffortToBudget(modelName, effort)
+			if ok {
+				switch budget {
+				case 0:
+					out, _ = sjson.Set(out, "thinking.type", "disabled")
+				case -1:
+					out, _ = sjson.Set(out, "thinking.type", "enabled")
+				default:
+					if budget > 0 {
+						out, _ = sjson.Set(out, "thinking.type", "enabled")
+						out, _ = sjson.Set(out, "thinking.budget_tokens", budget)
+					}
+				}
+			}
 		}
 	}
 
@@ -250,7 +254,10 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 				toolUse, _ = sjson.Set(toolUse, "id", callID)
 				toolUse, _ = sjson.Set(toolUse, "name", name)
 				if argsStr != "" && gjson.Valid(argsStr) {
-					toolUse, _ = sjson.SetRaw(toolUse, "input", argsStr)
+					argsJSON := gjson.Parse(argsStr)
+					if argsJSON.IsObject() {
+						toolUse, _ = sjson.SetRaw(toolUse, "input", argsJSON.Raw)
+					}
 				}
 
 				asst := `{"role":"assistant","content":[]}`
@@ -305,16 +312,18 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		case gjson.String:
 			switch toolChoice.String() {
 			case "auto":
-				out, _ = sjson.Set(out, "tool_choice", map[string]interface{}{"type": "auto"})
+				out, _ = sjson.SetRaw(out, "tool_choice", `{"type":"auto"}`)
 			case "none":
 				// Leave unset; implies no tools
 			case "required":
-				out, _ = sjson.Set(out, "tool_choice", map[string]interface{}{"type": "any"})
+				out, _ = sjson.SetRaw(out, "tool_choice", `{"type":"any"}`)
 			}
 		case gjson.JSON:
 			if toolChoice.Get("type").String() == "function" {
 				fn := toolChoice.Get("function.name").String()
-				out, _ = sjson.Set(out, "tool_choice", map[string]interface{}{"type": "tool", "name": fn})
+				toolChoiceJSON := `{"name":"","type":"tool"}`
+				toolChoiceJSON, _ = sjson.Set(toolChoiceJSON, "name", fn)
+				out, _ = sjson.SetRaw(out, "tool_choice", toolChoiceJSON)
 			}
 		default:
 

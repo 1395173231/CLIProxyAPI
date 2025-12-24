@@ -1,8 +1,9 @@
-// Package config provides configuration management for the CLI Proxy API server.
-// It handles loading and parsing YAML configuration files, and provides structured
-// access to application settings including server port, authentication directory,
-// debug settings, proxy configuration, and API keys.
+// Package config provides the public SDK configuration API.
+//
+// It re-exports the server configuration types and helpers so external projects can
+// embed CLIProxyAPI without importing internal packages.
 package config
+import internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
@@ -23,29 +24,30 @@ type SDKConfig struct {
 	StickyIndex StickyIndexConfig `yaml:"sticky-index,omitempty" json:"sticky-index,omitempty"`
 }
 
-// AccessConfig groups request authentication providers.
-type AccessConfig struct {
-	// Providers lists configured authentication providers.
-	Providers []AccessProvider `yaml:"providers,omitempty" json:"providers,omitempty"`
-}
+type SDKConfig = internalconfig.SDKConfig
+type AccessConfig = internalconfig.AccessConfig
+type AccessProvider = internalconfig.AccessProvider
 
-// AccessProvider describes a request authentication provider entry.
-type AccessProvider struct {
-	// Name is the instance identifier for the provider.
-	Name string `yaml:"name" json:"name"`
+type Config = internalconfig.Config
 
-	// Type selects the provider implementation registered via the SDK.
-	Type string `yaml:"type" json:"type"`
+type StreamingConfig = internalconfig.StreamingConfig
+type TLSConfig = internalconfig.TLSConfig
+type RemoteManagement = internalconfig.RemoteManagement
+type AmpCode = internalconfig.AmpCode
+type PayloadConfig = internalconfig.PayloadConfig
+type PayloadRule = internalconfig.PayloadRule
+type PayloadModelRule = internalconfig.PayloadModelRule
 
-	// SDK optionally names a third-party SDK module providing this provider.
-	SDK string `yaml:"sdk,omitempty" json:"sdk,omitempty"`
+type GeminiKey = internalconfig.GeminiKey
+type CodexKey = internalconfig.CodexKey
+type ClaudeKey = internalconfig.ClaudeKey
+type VertexCompatKey = internalconfig.VertexCompatKey
+type VertexCompatModel = internalconfig.VertexCompatModel
+type OpenAICompatibility = internalconfig.OpenAICompatibility
+type OpenAICompatibilityAPIKey = internalconfig.OpenAICompatibilityAPIKey
+type OpenAICompatibilityModel = internalconfig.OpenAICompatibilityModel
 
-	// APIKeys lists inline keys for providers that require them.
-	APIKeys []string `yaml:"api-keys,omitempty" json:"api-keys,omitempty"`
-
-	// Config passes provider-specific options to the implementation.
-	Config map[string]any `yaml:"config,omitempty" json:"config,omitempty"`
-}
+type TLS = internalconfig.TLSConfig
 
  // StickyIndexConfig defines optional Redis persistence for sticky routing.
  type StickyIndexConfig struct {
@@ -62,41 +64,30 @@ type AccessProvider struct {
  	// TTLSeconds expiration in seconds for bindings; <=0 uses default.
  	TTLSeconds int `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
  }
- 
- const (
- 	// AccessProviderTypeConfigAPIKey is the built-in provider validating inline API keys.
- 	AccessProviderTypeConfigAPIKey = "config-api-key"
- 
- 	// DefaultAccessProviderName is applied when no provider name is supplied.
- 	DefaultAccessProviderName = "config-inline"
- )
+const (
+	AccessProviderTypeConfigAPIKey = internalconfig.AccessProviderTypeConfigAPIKey
+	DefaultAccessProviderName      = internalconfig.DefaultAccessProviderName
+	DefaultPanelGitHubRepository   = internalconfig.DefaultPanelGitHubRepository
+)
 
-// ConfigAPIKeyProvider returns the first inline API key provider if present.
-func (c *SDKConfig) ConfigAPIKeyProvider() *AccessProvider {
-	if c == nil {
-		return nil
-	}
-	for i := range c.Access.Providers {
-		if c.Access.Providers[i].Type == AccessProviderTypeConfigAPIKey {
-			if c.Access.Providers[i].Name == "" {
-				c.Access.Providers[i].Name = DefaultAccessProviderName
-			}
-			return &c.Access.Providers[i]
-		}
-	}
-	return nil
+func MakeInlineAPIKeyProvider(keys []string) *AccessProvider {
+	return internalconfig.MakeInlineAPIKeyProvider(keys)
 }
 
-// MakeInlineAPIKeyProvider constructs an inline API key provider configuration.
-// It returns nil when no keys are supplied.
-func MakeInlineAPIKeyProvider(keys []string) *AccessProvider {
-	if len(keys) == 0 {
-		return nil
-	}
-	provider := &AccessProvider{
-		Name:    DefaultAccessProviderName,
-		Type:    AccessProviderTypeConfigAPIKey,
-		APIKeys: append([]string(nil), keys...),
-	}
-	return provider
+func LoadConfig(configFile string) (*Config, error) { return internalconfig.LoadConfig(configFile) }
+
+func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
+	return internalconfig.LoadConfigOptional(configFile, optional)
+}
+
+func SaveConfigPreserveComments(configFile string, cfg *Config) error {
+	return internalconfig.SaveConfigPreserveComments(configFile, cfg)
+}
+
+func SaveConfigPreserveCommentsUpdateNestedScalar(configFile string, path []string, value string) error {
+	return internalconfig.SaveConfigPreserveCommentsUpdateNestedScalar(configFile, path, value)
+}
+
+func NormalizeCommentIndentation(data []byte) []byte {
+	return internalconfig.NormalizeCommentIndentation(data)
 }

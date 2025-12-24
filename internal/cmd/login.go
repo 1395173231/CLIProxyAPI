@@ -55,30 +55,44 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	ctx := context.Background()
 
+	promptFn := options.Prompt
+	if promptFn == nil {
+		promptFn = defaultProjectPrompt()
+	}
+
+	trimmedProjectID := strings.TrimSpace(projectID)
+	callbackPrompt := promptFn
+	if trimmedProjectID == "" {
+		callbackPrompt = nil
+	}
+
 	loginOpts := &sdkAuth.LoginOptions{
 		NoBrowser: options.NoBrowser,
-		ProjectID: strings.TrimSpace(projectID),
+		ProjectID: trimmedProjectID,
 		Metadata:  map[string]string{},
-		Prompt:    options.Prompt,
+		Prompt:    callbackPrompt,
 	}
 
 	authenticator := sdkAuth.NewGeminiAuthenticator()
 	record, errLogin := authenticator.Login(ctx, cfg, loginOpts)
 	if errLogin != nil {
-		log.Fatalf("Gemini authentication failed: %v", errLogin)
+		log.Errorf("Gemini authentication failed: %v", errLogin)
 		return
 	}
 
 	storage, okStorage := record.Storage.(*gemini.GeminiTokenStorage)
 	if !okStorage || storage == nil {
-		log.Fatal("Gemini authentication failed: unsupported token storage")
+		log.Error("Gemini authentication failed: unsupported token storage")
 		return
 	}
 
 	geminiAuth := gemini.NewGeminiAuth()
-	httpClient, errClient := geminiAuth.GetAuthenticatedClient(ctx, storage, cfg, options.NoBrowser)
+	httpClient, errClient := geminiAuth.GetAuthenticatedClient(ctx, storage, cfg, &gemini.WebLoginOptions{
+		NoBrowser: options.NoBrowser,
+		Prompt:    callbackPrompt,
+	})
 	if errClient != nil {
-		log.Fatalf("Gemini authentication failed: %v", errClient)
+		log.Errorf("Gemini authentication failed: %v", errClient)
 		return
 	}
 
@@ -86,23 +100,18 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	projects, errProjects := fetchGCPProjects(ctx, httpClient)
 	if errProjects != nil {
-		log.Fatalf("Failed to get project list: %v", errProjects)
+		log.Errorf("Failed to get project list: %v", errProjects)
 		return
 	}
 
-	promptFn := options.Prompt
-	if promptFn == nil {
-		promptFn = defaultProjectPrompt()
-	}
-
-	selectedProjectID := promptForProjectSelection(projects, strings.TrimSpace(projectID), promptFn)
+	selectedProjectID := promptForProjectSelection(projects, trimmedProjectID, promptFn)
 	projectSelections, errSelection := resolveProjectSelections(selectedProjectID, projects)
 	if errSelection != nil {
-		log.Fatalf("Invalid project selection: %v", errSelection)
+		log.Errorf("Invalid project selection: %v", errSelection)
 		return
 	}
 	if len(projectSelections) == 0 {
-		log.Fatal("No project selected; aborting login.")
+		log.Error("No project selected; aborting login.")
 		return
 	}
 
@@ -116,7 +125,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 				showProjectSelectionHelp(storage.Email, projects)
 				return
 			}
-			log.Fatalf("Failed to complete user setup: %v", errSetup)
+			log.Errorf("Failed to complete user setup: %v", errSetup)
 			return
 		}
 		finalID := strings.TrimSpace(storage.ProjectID)
@@ -133,11 +142,11 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 		for _, pid := range activatedProjects {
 			isChecked, errCheck := checkCloudAPIIsEnabled(ctx, httpClient, pid)
 			if errCheck != nil {
-				log.Fatalf("Failed to check if Cloud AI API is enabled for %s: %v", pid, errCheck)
+				log.Errorf("Failed to check if Cloud AI API is enabled for %s: %v", pid, errCheck)
 				return
 			}
 			if !isChecked {
-				log.Fatalf("Failed to check if Cloud AI API is enabled for project %s. If you encounter an error message, please create an issue.", pid)
+				log.Errorf("Failed to check if Cloud AI API is enabled for project %s. If you encounter an error message, please create an issue.", pid)
 				return
 			}
 		}
@@ -153,7 +162,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 
 	savedPath, errSave := store.Save(ctx, record)
 	if errSave != nil {
-		log.Fatalf("Failed to save token to file: %v", errSave)
+		log.Errorf("Failed to save token to file: %v", errSave)
 		return
 	}
 
@@ -555,6 +564,7 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 				continue
 			}
 		}
+		_ = resp.Body.Close()
 		return false, fmt.Errorf("project activation required: %s", errMessage)
 	}
 	return true, nil
