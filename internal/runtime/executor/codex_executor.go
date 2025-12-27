@@ -4,11 +4,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	httpf "github.com/bogdanfinn/fhttp"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -409,11 +415,16 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 					now := time.Now().Unix()
 					if claim.Exp > (now + 60*60) {
 						auth.Metadata["email"] = claim.HttpsApiOpenaiComProfile.Email
-						auth.Metadata["account_id"] = claim.HttpsApiOpenaiComAuth.ChatgptAccountId
 						// Use unified key in files
 						auth.Metadata["expired"] = claim.Exp
 						auth.Metadata["type"] = "codex"
-						return auth, nil
+						_, baseURL := codexCreds(auth)
+						err := e.maybeUpdateCodexAccountID(ctx, auth, accessToken, baseURL)
+						if err == nil {
+							now := time.Now().Format(time.RFC3339)
+							auth.Metadata["last_refresh"] = now
+							return auth, nil
+						}
 					}
 				}
 			}
@@ -447,6 +458,11 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	auth.Metadata["type"] = "codex"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
+	_, baseURL := codexCreds(auth)
+	err = e.maybeUpdateCodexAccountID(ctx, auth, td.AccessToken, baseURL)
+	if err != nil {
+		return nil, err
+	}
 	return auth, nil
 }
 
@@ -511,7 +527,6 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string) {
 			if tok, err := util.CheckToken(token); err == nil {
 				if claim, ok := (*tok).Claims.(*util.CodexClaim); ok {
 					auth.Metadata["email"] = claim.HttpsApiOpenaiComProfile.Email
-					auth.Metadata["account_id"] = claim.HttpsApiOpenaiComAuth.ChatgptAccountId
 					// Use unified key in files
 				}
 			}
@@ -541,4 +556,203 @@ func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 		}
 	}
 	return
+}
+
+const (
+	defaultCodexBaseURL           = "https://chatgpt.com/backend-api/codex"
+	codexAccountsCheckPath        = "/backend-api/accounts/check/v4-2023-04-27"
+	defaultTimezoneOffsetMinutes  = -480
+	codexAccountsCheckMinInterval = 6 * time.Hour
+)
+
+type codexAccountsCheckResponse struct {
+	Accounts map[string]struct {
+		Account struct {
+			IsDeactivated bool   `json:"is_deactivated"`
+			PlanType      string `json:"plan_type"`
+			AccountID     string `json:"account_id"`
+		} `json:"account"`
+	} `json:"accounts"`
+}
+
+func (e *CodexExecutor) maybeUpdateCodexAccountID(ctx context.Context, auth *cliproxyauth.Auth, token, baseURL string) error {
+	if e == nil || auth == nil {
+		return nil
+	}
+	if strings.TrimSpace(token) == "" {
+		return nil
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+
+	if last, ok := auth.Metadata["last_subscription_check"].(string); ok {
+		if ts, err := time.Parse(time.RFC3339, strings.TrimSpace(last)); err == nil {
+			if time.Since(ts) < codexAccountsCheckMinInterval {
+				return nil
+			}
+		}
+	}
+
+	origin := codexBaseOrigin(baseURL)
+	if origin == "" {
+		return nil
+	}
+
+	tzOffset := defaultTimezoneOffsetMinutes
+	if raw, ok := auth.Metadata["timezone_offset_min"]; ok {
+		if v, okNum := raw.(int); okNum {
+			tzOffset = v
+		} else if v64, okNum := raw.(int64); okNum {
+			tzOffset = int(v64)
+		} else if s, okStr := raw.(string); okStr {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+				tzOffset = parsed
+			}
+		}
+	}
+
+	checkURL := origin + codexAccountsCheckPath + "?timezone_offset_min=" + strconv.Itoa(tzOffset)
+	req, err := httpf.NewRequestWithContext(ctx, http.MethodGet, checkURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header = httpf.Header{
+		"accept":          {"*/*"},
+		"accept-language": {"zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7"},
+		"authorization":   {"Bearer " + token},
+		"cache-control":   {"no-cache"},
+		"pragma":          {"no-cache"},
+		"user-agent":      {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"},
+		"origin":          {origin},
+		"referer":         {origin + "/"},
+		httpf.HeaderOrderKey: {
+			"accept",
+			"accept-language",
+			"authorization",
+			"cache-control",
+			"pragma",
+			"user-agent",
+			"origin",
+			"referer",
+		},
+	}
+
+	httpClient, errClient := newProxyAwareTLSClient(ctx, e.cfg, auth, 30)
+	if errClient != nil {
+		return nil
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		log.Errorf("codex account check failed: %d - %s", resp.StatusCode, string(body))
+		return nil
+	}
+
+	var parsed codexAccountsCheckResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return err
+	}
+
+	bestID, bestPlan := bestSubscribedAccount(parsed)
+	if strings.TrimSpace(bestID) != "" {
+		if current, _ := auth.Metadata["account_id"].(string); strings.TrimSpace(current) != strings.TrimSpace(bestID) {
+			log.Infof("codex account_id updated via subscription check: %s -> %s (plan=%s)", strings.TrimSpace(current), strings.TrimSpace(bestID), bestPlan)
+			auth.Metadata["account_id"] = strings.TrimSpace(bestID)
+		}
+		auth.Metadata["account_plan_type"] = bestPlan
+	} else if hasAnyPaidCodexSubscription(parsed) {
+		// Paid exists but not selectable (e.g. missing account_id) -> do nothing.
+	} else {
+		// No paid subscription at all: disable free-tier account_id to avoid sending Chatgpt-Account-Id for free.
+		if _, ok := auth.Metadata["account_id"]; ok {
+			delete(auth.Metadata, "account_id")
+		}
+		delete(auth.Metadata, "account_plan_type")
+		auth.Metadata["disabled"] = true
+		auth.Metadata["unavailable"] = true
+		auth.Metadata["status"] = "disabled"
+		return errors.New("codex account check failed, no subscription found")
+	}
+
+	auth.Metadata["last_subscription_check"] = time.Now().Format(time.RFC3339)
+	return nil
+}
+
+func bestSubscribedAccount(resp codexAccountsCheckResponse) (accountID string, planType string) {
+	if len(resp.Accounts) == 0 {
+		return "", ""
+	}
+	priority := map[string]int{
+		"team": 3,
+		"pro":  2,
+		"plus": 1,
+	}
+	bestScore := 0
+	for key, item := range resp.Accounts {
+		if strings.EqualFold(strings.TrimSpace(key), "default") {
+			continue
+		}
+		if item.Account.IsDeactivated {
+			continue
+		}
+		plan := strings.ToLower(strings.TrimSpace(item.Account.PlanType))
+		score, ok := priority[plan]
+		if !ok || score <= 0 {
+			continue
+		}
+		id := strings.TrimSpace(item.Account.AccountID)
+		if id == "" {
+			continue
+		}
+		if score > bestScore {
+			bestScore = score
+			accountID = id
+			planType = plan
+		}
+	}
+	return accountID, planType
+}
+
+func hasAnyPaidCodexSubscription(resp codexAccountsCheckResponse) bool {
+	if len(resp.Accounts) == 0 {
+		return false
+	}
+	for key, item := range resp.Accounts {
+		if strings.EqualFold(strings.TrimSpace(key), "default") {
+			continue
+		}
+		if item.Account.IsDeactivated {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(item.Account.PlanType)) {
+		case "team", "pro", "plus":
+			return true
+		default:
+		}
+	}
+	return false
+}
+
+func codexBaseOrigin(baseURL string) string {
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		base = defaultCodexBaseURL
+	}
+	u, err := url.Parse(base)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		u2, err2 := url.Parse(defaultCodexBaseURL)
+		if err2 != nil || u2.Scheme == "" || u2.Host == "" {
+			return ""
+		}
+		return u2.Scheme + "://" + u2.Host
+	}
+	return u.Scheme + "://" + u.Host
 }

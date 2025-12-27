@@ -38,35 +38,39 @@ func NormalizeThinkingModel(modelName string) (string, map[string]any) {
 		matched         bool
 	)
 
-	// Match "(<value>)" pattern at the end of the model name
+	// 1) "(...)" suffix (budget or reasoning effort)
 	if idx := strings.LastIndex(modelName, "("); idx != -1 {
-		if !strings.HasSuffix(modelName, ")") {
-			// Incomplete parenthesis, ignore
-			return baseModel, nil
+		if strings.HasSuffix(modelName, ")") {
+			value := modelName[idx+1 : len(modelName)-1]
+			if value != "" { // ignore "()"
+				candidateBase := modelName[:idx]
+
+				if parsed, ok := parseIntPrefix(value); ok {
+					baseModel = candidateBase
+					budgetOverride = &parsed
+					matched = true
+				} else {
+					raw := strings.ToLower(strings.TrimSpace(value))
+					if eff, ok := normalizeEffort(raw); ok {
+						baseModel = candidateBase
+						reasoningEffort = &eff
+						matched = true
+					}
+				}
+			}
 		}
+		// incomplete "(..." -> ignore and continue to legacy parsing
+	}
 
-		value := modelName[idx+1 : len(modelName)-1] // Extract content between ( and )
-		if value == "" {
-			// Empty parentheses not supported
-			return baseModel, nil
-		}
-
-		candidateBase := modelName[:idx]
-
-		// Auto-detect: pure numeric → budget, string → reasoning effort level
-		if parsed, ok := parseIntPrefix(value); ok {
-			// Numeric value: treat as thinking budget
-			baseModel = candidateBase
-			budgetOverride = &parsed
+	// 2) Legacy suffix tags: "-none/-low/-medium/-high/-xhigh"
+	if trimmed, eff, ok := parseLegacyEffortSuffix(baseModel); ok {
+		baseModel = trimmed         // always strip recognized tag
+		if reasoningEffort == nil { // only fill if "(...)" didn't set it
+			reasoningEffort = &eff
 			matched = true
 		} else {
-			// String value: treat as reasoning effort level
-			baseModel = candidateBase
-			raw := strings.ToLower(strings.TrimSpace(value))
-			if raw != "" {
-				reasoningEffort = &raw
-				matched = true
-			}
+			// tag was present but overridden by "(...)"; still consider it a match? up to you
+			matched = true
 		}
 	}
 
@@ -84,6 +88,35 @@ func NormalizeThinkingModel(modelName string) (string, map[string]any) {
 		metadata[ReasoningEffortMetadataKey] = *reasoningEffort
 	}
 	return baseModel, metadata
+}
+
+func normalizeEffort(raw string) (string, bool) {
+	switch raw {
+	case "none", "low", "medium", "high", "xhigh":
+		return raw, true
+	default:
+		return "", false
+	}
+}
+
+func parseLegacyEffortSuffix(model string) (trimmed string, effort string, ok bool) {
+	lower := strings.ToLower(model)
+
+	// order matters: check longer suffix first to avoid "-high" matching "-xhigh"
+	switch {
+	case strings.HasSuffix(lower, "-xhigh"):
+		return model[:len(model)-len("-xhigh")], "xhigh", true
+	case strings.HasSuffix(lower, "-medium"):
+		return model[:len(model)-len("-medium")], "medium", true
+	case strings.HasSuffix(lower, "-none"):
+		return model[:len(model)-len("-none")], "none", true
+	case strings.HasSuffix(lower, "-high"):
+		return model[:len(model)-len("-high")], "high", true
+	case strings.HasSuffix(lower, "-low"):
+		return model[:len(model)-len("-low")], "low", true
+	default:
+		return model, "", false
+	}
 }
 
 // ThinkingFromMetadata extracts thinking overrides from metadata produced by NormalizeThinkingModel.

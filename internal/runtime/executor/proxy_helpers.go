@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	httpf "github.com/bogdanfinn/fhttp"
+	tls_client "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -113,4 +116,46 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 	}
 
 	return transport
+}
+
+type tlsDoer interface {
+	Do(req *httpf.Request) (*httpf.Response, error)
+}
+
+var newTLSHTTPClient = func(options ...tls_client.HttpClientOption) (tlsDoer, error) {
+	return tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
+}
+
+func newProxyAwareTLSClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeoutSeconds int) (tlsDoer, error) {
+	var proxyURL string
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	options := []tls_client.HttpClientOption{
+		tls_client.WithTimeoutSeconds(timeoutSeconds),
+		tls_client.WithClientProfile(profiles.Safari_IOS_18_0),
+		tls_client.WithNotFollowRedirects(),
+		tls_client.WithCookieJar(tls_client.NewCookieJar()),
+		tls_client.WithCatchPanics(),
+	}
+
+	if proxyURL != "" {
+		options = append(options, tls_client.WithProxyUrl(proxyURL))
+	}
+
+	client, err := newTLSHTTPClient(options...)
+	if err != nil {
+		return nil, err
+	}
+
+	// Best-effort: align per-request RoundTripper when host injects one (tests).
+	// tls-client uses fhttp internals; we can only control Dial/Proxy via its own options.
+	_ = ctx
+	_ = httpf.HeaderOrderKey
+
+	return client, nil
 }

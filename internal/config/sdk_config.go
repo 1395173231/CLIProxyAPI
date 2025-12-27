@@ -4,6 +4,21 @@
 // debug settings, proxy configuration, and API keys.
 package config
 
+type StickyIndexConfig struct {
+	// RedisEnabled toggles Redis-backed persistence.
+	RedisEnabled bool `yaml:"redis-enabled" json:"redis-enabled"`
+	// RedisAddr is host:port (e.g., "127.0.0.1:6379").
+	RedisAddr string `yaml:"redis-addr,omitempty" json:"redis-addr,omitempty"`
+	// RedisPassword optional password.
+	RedisPassword string `yaml:"redis-password,omitempty" json:"redis-password,omitempty"`
+	// RedisDB database index.
+	RedisDB int `yaml:"redis-db,omitempty" json:"redis-db,omitempty"`
+	// RedisPrefix key prefix (default "msgidx").
+	RedisPrefix string `yaml:"redis-prefix,omitempty" json:"redis-prefix,omitempty"`
+	// TTLSeconds expiration in seconds for bindings; <=0 uses default.
+	TTLSeconds int `yaml:"ttl-seconds,omitempty" json:"ttl-seconds,omitempty"`
+}
+
 // SDKConfig represents the application's configuration, loaded from a YAML file.
 type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
@@ -25,6 +40,10 @@ type SDKConfig struct {
 
 	// Streaming configures server-side streaming behavior (keep-alives and safe bootstrap retries).
 	Streaming StreamingConfig `yaml:"streaming" json:"streaming"`
+
+	// StickyIndex configures optional persistence for the low-memory message index
+	// used by SmartStickySelector to keep sticky routing across restarts.
+	StickyIndex StickyIndexConfig `yaml:"sticky-index,omitempty" json:"sticky-index,omitempty"`
 }
 
 // StreamingConfig holds server streaming behavior configuration.

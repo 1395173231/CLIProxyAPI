@@ -1,6 +1,6 @@
 services:
   cli-proxy-api:
-    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
+    image: docker.io/ahhhliu/cli-proxy-api:20251213.1605-3296
     pull_policy: always
     build:
       context: .
